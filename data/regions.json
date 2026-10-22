@@ -1,0 +1,11 @@
+{
+  "note": "Synthetic, rounded grid carbon intensity in gCO2e per kWh. For development only.",
+  "regions": {
+    "us-east-1":    {"name": "N. Virginia", "carbon_gco2_per_kwh": 380},
+    "us-west-2":    {"name": "Oregon",      "carbon_gco2_per_kwh": 120},
+    "eu-west-1":    {"name": "Ireland",     "carbon_gco2_per_kwh": 290},
+    "eu-central-1": {"name": "Frankfurt",   "carbon_gco2_per_kwh": 340},
+    "eu-north-1":   {"name": "Stockholm",   "carbon_gco2_per_kwh": 30},
+    "ap-south-1":   {"name": "Mumbai",      "carbon_gco2_per_kwh": 700}
+  }
+}

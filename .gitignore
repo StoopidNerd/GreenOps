@@ -1,0 +1,24 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Secrets - never commit these
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Terraform local state / providers
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

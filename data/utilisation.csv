@@ -1,0 +1,15 @@
+resource_id,instance_type,region,environment,avg_cpu_pct,max_cpu_pct,avg_mem_pct,monthly_hours,owner
+web-01,m5.xlarge,us-east-1,prod,42.5,78.0,61.2,730,platform-team
+web-02,m5.xlarge,us-east-1,prod,39.8,74.5,58.9,730,platform-team
+api-01,m5.large,eu-west-1,prod,55.1,88.3,70.4,730,backend-team
+api-02,m5.large,eu-west-1,prod,12.4,35.6,28.1,730,backend-team
+batch-01,c5.xlarge,us-west-2,prod,18.7,92.0,33.5,420,data-team
+batch-02,c5.xlarge,us-west-2,prod,3.2,11.0,12.8,730,data-team
+dev-sandbox-01,m5.2xlarge,us-east-1,dev,2.1,9.4,8.3,730,ml-team
+dev-sandbox-02,m5.xlarge,ap-south-1,dev,4.6,15.2,14.0,730,ml-team
+staging-01,t3.medium,eu-central-1,staging,8.9,26.7,31.5,730,qa-team
+staging-02,t3.medium,eu-central-1,staging,1.4,6.1,9.7,730,qa-team
+cache-01,r5.large,eu-north-1,prod,61.3,83.9,77.6,730,platform-team
+cron-01,t3.micro,eu-north-1,prod,6.8,22.4,35.0,730,ops-team
+analytics-01,r5.large,ap-south-1,prod,27.5,64.2,52.8,730,data-team
+test-runner-01,c5.xlarge,us-west-2,dev,0.9,4.3,6.2,730,qa-team
