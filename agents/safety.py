@@ -7,6 +7,7 @@ They never deploy infrastructure or modify Terraform files.
 
 import sys
 from pathlib import Path
+from typing import List
 
 # Make the GreenOps project root available for imports
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
