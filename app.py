@@ -16,11 +16,7 @@ import pandas as pd
 import streamlit as st
 
 from agents.orchestrator import report_to_dict
-from agents.runtime import run_sample_pipeline, parse_terraform_resources
-from agents.fixer import generate_optimized_terraform
-from agents.approval import record_decision, approval_matches
-from agents.approval_workflow import export_with_approval
-from contracts import OptimizationRecommendation
+from agents.runtime import run_sample_pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
@@ -254,6 +250,134 @@ def build_savings_comparison(recommendations: list[dict]) -> tuple[list[dict], l
     return rows, assumptions
 
 
+
+def build_memory_comparison(
+    recommendations: list[dict], findings: list[dict]
+) -> tuple[list[dict], list[str]]:
+    """Build a transparent memory scenario from explicit recs or safe candidates.
+
+    If the Fixer did not emit a target instance, an illustrative candidate is
+    generated only for underused findings, using synthetic specs and conservative
+    average-memory/peak-CPU headroom checks. This is not an applied change.
+    """
+    import csv
+
+    pricing_path = DATA_DIR / "pricing.json"
+    metrics_path = DATA_DIR / "utilisation_backup.csv"
+    notes: list[str] = []
+    try:
+        with pricing_path.open("r", encoding="utf-8") as handle:
+            pricing = json.load(handle)
+        with metrics_path.open("r", encoding="utf-8", newline="") as handle:
+            metrics = {str(row.get("resource_id", "")).strip(): row for row in csv.DictReader(handle)}
+    except (OSError, ValueError, KeyError) as exc:
+        return [], [f"Could not load memory assumptions: {exc}"]
+
+    instances = pricing.get("instances", {})
+    if not isinstance(instances, dict) or not instances:
+        return [], ["data/pricing.json has no usable 'instances' dictionary."]
+
+    # Normalize the incoming report so field-name differences do not silently
+    # hide usable recommendations. Findings provide the observed utilization.
+    rec_by_id: dict[str, dict] = {}
+    for rec in recommendations:
+        rid = str(rec.get("resource_id") or "").strip()
+        if rid:
+            rec_by_id[rid] = rec
+
+    finding_by_id: dict[str, dict] = {}
+    for finding in findings:
+        rid = str(finding.get("resource_id") or "").strip()
+        if rid:
+            finding_by_id[rid] = finding
+
+    resource_ids = list(dict.fromkeys(list(rec_by_id) + list(finding_by_id)))
+    rows: list[dict] = []
+    for rid in resource_ids:
+        rec = rec_by_id.get(rid, {})
+        finding = finding_by_id.get(rid, {})
+        evidence = finding.get("evidence") if isinstance(finding.get("evidence"), dict) else {}
+        metric = metrics.get(rid, {})
+
+        current_type = (rec.get("current_instance_type") or rec.get("instance_type")
+                        or evidence.get("instance_type") or metric.get("instance_type"))
+        target_type = (rec.get("suggested_instance_type") or rec.get("target_instance_type")
+                       or rec.get("recommended_instance_type") or rec.get("suggested_type"))
+        current_spec = instances.get(current_type, {}) if current_type else {}
+        if not isinstance(current_spec, dict) or number(current_spec.get("memory_gib")) is None:
+            notes.append(f"{rid}: current instance type {current_type!r} is missing from pricing.json.")
+            continue
+
+        mem_pct = number(evidence.get("avg_mem_pct"))
+        if mem_pct is None:
+            mem_pct = number(metric.get("avg_mem_pct"))
+        cpu_peak = number(evidence.get("max_cpu_pct"))
+        if cpu_peak is None:
+            cpu_peak = number(metric.get("max_cpu_pct"))
+        if mem_pct is None or not 0 <= mem_pct <= 100:
+            notes.append(f"{rid}: average memory utilization is missing or invalid; excluded.")
+            continue
+
+        # Only infer a candidate when the analyzer explicitly marks the resource
+        # underused. Idle resources need a separate shutdown/scheduling review.
+        finding_type = str(finding.get("finding_type") or finding.get("status") or "").lower()
+        if not target_type and finding_type in {
+            "underused", "underutilized", "underutilised", "over_provisioned",
+            "overprovisioned", "right_size", "rightsize"
+        }:
+            current_mem = float(current_spec["memory_gib"])
+            estimated_used = current_mem * mem_pct / 100.0
+            current_vcpu = number(current_spec.get("vcpu")) or 0
+            candidates = []
+            for candidate, spec in instances.items():
+                if not isinstance(spec, dict) or candidate == current_type:
+                    continue
+                candidate_mem = number(spec.get("memory_gib"))
+                candidate_vcpu = number(spec.get("vcpu"))
+                if candidate_mem is None or candidate_vcpu is None:
+                    continue
+                # Keep average memory <=75% and projected peak CPU <=80%.
+                projected_mem_pct = (estimated_used / candidate_mem * 100.0) if candidate_mem else 999
+                projected_cpu = (cpu_peak * current_vcpu / candidate_vcpu) if cpu_peak is not None and candidate_vcpu else None
+                if candidate_mem < current_mem and projected_mem_pct <= 75 and (projected_cpu is None or projected_cpu <= 80):
+                    candidates.append((candidate_mem, candidate))
+            if candidates:
+                target_type = min(candidates)[1]
+                notes.append(f"{rid}: proposed type {target_type} is an illustrative candidate inferred from the underused signal; verify peak/headroom before acting.")
+
+        if not target_type:
+            notes.append(f"{rid}: no right-sizing target was emitted and no safe underused candidate could be inferred.")
+            continue
+
+        target_spec = instances.get(target_type, {})
+        if not isinstance(target_spec, dict) or number(target_spec.get("memory_gib")) is None:
+            notes.append(f"{rid}: proposed type {target_type!r} is missing from pricing.json.")
+            continue
+
+        current_mem = float(current_spec["memory_gib"])
+        target_mem = float(target_spec["memory_gib"])
+        estimated_used = current_mem * mem_pct / 100.0
+        before_unused = max(current_mem - estimated_used, 0.0)
+        after_unused = max(target_mem - estimated_used, 0.0)
+        target_risk = estimated_used > target_mem
+        rows.append({
+            "Resource": rid,
+            "Current instance": current_type,
+            "Proposed instance": target_type,
+            "Average memory utilization (%)": round(mem_pct, 1),
+            "Current allocated memory (GiB)": round(current_mem, 2),
+            "Estimated workload memory used (GiB)": round(estimated_used, 2),
+            "Proposed allocated memory (GiB)": round(target_mem, 2),
+            "Capacity released (GiB)": round(current_mem - target_mem, 2),
+            "Estimated unused before (GiB)": round(before_unused, 2),
+            "Estimated unused after (GiB)": round(after_unused, 2),
+            "Unused capacity reduction (%)": round((before_unused - after_unused) / before_unused * 100, 1) if before_unused > 0 else None,
+            "Capacity check": "REVIEW: proposed memory below estimated current use" if target_risk else "Average-use check passed; peak headroom still needs validation",
+            "Scenario type": "Existing recommendation" if (rec.get("suggested_instance_type") or rec.get("target_instance_type") or rec.get("recommended_instance_type") or rec.get("suggested_type")) else "Illustrative candidate — not an approved recommendation",
+        })
+
+    return rows, notes
+
 def run_pipeline() -> None:
     try:
         with st.spinner("Analyzing synthetic resource data…"):
@@ -262,48 +386,9 @@ def run_pipeline() -> None:
             st.session_state["greenops_last_run"] = datetime.now().astimezone().strftime(
                 "%Y-%m-%d %H:%M:%S %Z"
             )
-            # A fresh analysis must never inherit an approval from an older proposal.
-            for key in ("greenops_approval", "greenops_approval_diff", "greenops_approval_status", "greenops_approved_patch"):
-                st.session_state.pop(key, None)
             st.session_state.pop("greenops_run_error", None)
     except Exception as exc:
         st.session_state["greenops_run_error"] = f"{type(exc).__name__}: {exc}"
-
-
-def build_proposal(report: dict) -> tuple[str, str, list[dict], list[dict]]:
-    """Build an in-memory Terraform proposal; never edits the source file."""
-    recs = as_records(report.get("recommendations"))
-    if not recs:
-        return "", "", [], []
-    typed_recs = [
-        OptimizationRecommendation(
-            resource_id=str(item.get("resource_id", "")),
-            current_instance_type=str(item.get("current_instance_type", "")),
-            suggested_instance_type=item.get("suggested_instance_type"),
-            reason=str(item.get("reason", "")),
-            estimated_monthly_savings_usd=number(item.get("estimated_monthly_savings_usd")),
-            estimated_monthly_carbon_reduction_kg=number(item.get("estimated_monthly_carbon_reduction_kg")),
-            requires_human_approval=True,
-        )
-        for item in recs
-    ]
-    tf_path = PROJECT_ROOT / "sample_infra" / "main.tf"
-    if not tf_path.is_file():
-        return "", "", [], [{"agent": "approval", "message": f"Terraform sample not found: {tf_path}"}]
-    source = tf_path.read_text(encoding="utf-8")
-    resources = parse_terraform_resources(tf_path)
-    proposed_text, diff, checks_out, errors_out = generate_optimized_terraform(
-        source, typed_recs, resources
-    )
-    check_rows = [
-        {"name": c.name, "status": c.status, "message": c.message}
-        for c in checks_out
-    ]
-    error_rows = [
-        {"agent": e.agent, "resource_id": e.resource_id, "message": e.message}
-        for e in errors_out
-    ]
-    return proposed_text, diff, check_rows, error_rows
 
 
 # Sidebar: clear scope and a single, explicit way to rerun the analysis.
@@ -395,12 +480,13 @@ st.caption(
     f"Potential savings shown below are illustrative scenarios, not guaranteed outcomes."
 )
 
-overview_tab, findings_tab, impact_tab, roi_tab, recommendations_tab, validation_tab = st.tabs(
+overview_tab, findings_tab, impact_tab, roi_tab, memory_tab, recommendations_tab, validation_tab = st.tabs(
     [
         "Overview",
         "Resource findings",
         "Cost & carbon",
         "Savings & ROI",
+        "Before vs After Memory",
         "Recommendations & approval",
         "Validation & errors",
     ]
@@ -608,11 +694,97 @@ with roi_tab:
                 st.write(f"- {note}")
 
 
+
+with memory_tab:
+    st.markdown("### Before vs after: memory capacity and estimated waste")
+    st.caption(
+        "This comparison uses average memory utilization from the sample utilization data "
+        "and memory capacity from synthetic instance specifications. It estimates unused "
+        "allocated capacity; it is not a direct measurement of physical RAM or a production guarantee."
+    )
+    memory_rows, memory_notes = build_memory_comparison(recommendations, findings)
+    if not memory_rows:
+        st.info(
+            "No valid before/after memory scenario could be calculated. GreenOps only infers an "
+            "illustrative smaller instance for findings explicitly marked underused and only when "
+            "the synthetic memory and CPU headroom checks pass."
+        )
+        if memory_notes:
+            with st.expander("Why resources were excluded"):
+                for note in memory_notes:
+                    st.write(f"- {note}")
+    else:
+        memory_df = pd.DataFrame(memory_rows)
+        total_before_mem = float(memory_df["Current allocated memory (GiB)"].sum())
+        total_after_mem = float(memory_df["Proposed allocated memory (GiB)"].sum())
+        total_before_unused = float(memory_df["Estimated unused before (GiB)"].sum())
+        total_after_unused = float(memory_df["Estimated unused after (GiB)"].sum())
+        total_capacity_released = total_before_mem - total_after_mem
+        unused_reduction_pct = (
+            (total_before_unused - total_after_unused) / total_before_unused * 100.0
+            if total_before_unused > 0 else None
+        )
+        mem_cols = st.columns(4)
+        mem_cols[0].metric("Allocated memory before", f"{total_before_mem:,.2f} GiB")
+        mem_cols[1].metric("Allocated memory after", f"{total_after_mem:,.2f} GiB")
+        mem_cols[2].metric("Capacity released", f"{total_capacity_released:,.2f} GiB")
+        mem_cols[3].metric(
+            "Estimated unused-capacity reduction",
+            f"{unused_reduction_pct:,.1f}%" if unused_reduction_pct is not None else "—",
+        )
+
+        st.markdown("#### The visible difference")
+        chart_cols = st.columns(2)
+        with chart_cols[0]:
+            st.markdown("**Allocated memory by resource (GiB)**")
+            allocated_chart = memory_df.set_index("Resource")[
+                ["Current allocated memory (GiB)", "Proposed allocated memory (GiB)"]
+            ]
+            st.bar_chart(allocated_chart, height=300)
+        with chart_cols[1]:
+            st.markdown("**Estimated unused capacity (GiB)**")
+            unused_chart = memory_df.set_index("Resource")[
+                ["Estimated unused before (GiB)", "Estimated unused after (GiB)"]
+            ]
+            st.bar_chart(unused_chart, height=300)
+
+        st.markdown("#### Resource-level evidence and proposed change")
+        st.dataframe(memory_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download memory before/after CSV",
+            data=memory_df.to_csv(index=False).encode("utf-8"),
+            file_name="greenops_memory_before_after.csv",
+            mime="text/csv",
+        )
+        unsafe = memory_df[memory_df["Capacity check"].str.startswith("REVIEW:")]
+        if not unsafe.empty:
+            st.warning(
+                f"{len(unsafe)} proposed change(s) have less memory than the estimated average "
+                "workload use. Do not present these as safe savings; review/reject or resize the target."
+            )
+
+    with st.expander("How memory waste is estimated"):
+        st.markdown(
+            """
+            - **Estimated workload memory used** = current instance memory capacity × recorded average memory utilization (%).
+            - **Estimated unused capacity before** = current capacity − estimated workload memory used.
+            - **Estimated unused capacity after** = max(proposed capacity − estimated workload memory used, 0).
+            - **Capacity released** = current allocated capacity − proposed allocated capacity. A negative number means the proposed type allocates more memory.
+            - This is a simplified average-utilization estimate. Peak usage, safety headroom, workload changes, cache behavior, and real cloud telemetry are not modeled. A proposed target below estimated current use is flagged for review.
+            - All values rely on synthetic instance specifications and sample data; they are not measured production savings.
+            """
+        )
+    if memory_notes:
+        with st.expander("Memory comparison notes"):
+            for note in memory_notes:
+                st.write(f"- {note}")
+
+
 with recommendations_tab:
     st.markdown("### Proposed optimizations")
     st.caption(
-        "Review each suggestion before exporting a patch. Approval is tied to the exact proposal; "
-        "no cloud changes are applied by this dashboard."
+        "Recommendations are suggestions only. Review the rationale and data alignment "
+        "before approving any future configuration change."
     )
     if recommendation_rows:
         rec_df = pd.DataFrame(recommendation_rows)
@@ -623,107 +795,11 @@ with recommendations_tab:
             file_name="greenops_recommendations.csv",
             mime="text/csv",
         )
-
-        st.divider()
-        st.markdown("### Human approval")
-        st.write(
-            "GreenOps has prepared a proposed Terraform diff for review. Read the changes and "
-            "validation results before recording a decision. Approving only enables export of a "
-            "`.patch` file; it does not deploy or apply the change."
+        st.info(
+            f"{approval_count} recommendation(s) require human approval. "
+            "Approval/rejection actions are intentionally not simulated here; "
+            "connect the Stage 5 approval workflow when your teammate's implementation is ready."
         )
-        proposed_text, proposal_diff, proposal_checks, proposal_errors = build_proposal(report)
-        alignment_checks = [c for c in checks if c.get("name") == "terraform_data_alignment"]
-        alignment_ok = bool(alignment_checks) and all(c.get("status") == "passed" for c in alignment_checks)
-        proposal_checks_ok = bool(proposal_checks) and all(c.get("status") == "passed" for c in proposal_checks)
-        proposal_ok = bool(proposal_diff.strip()) and alignment_ok and proposal_checks_ok and not proposal_errors
-
-        if proposal_diff:
-            with st.expander("Review proposed Terraform diff", expanded=True):
-                st.code(proposal_diff, language="diff")
-                st.download_button(
-                    "Download proposed diff for review (not approved)",
-                    data=proposal_diff.encode("utf-8"),
-                    file_name="greenops_proposed_review.diff",
-                    mime="text/plain",
-                    key="download_unapproved_diff",
-                )
-        else:
-            st.warning("A Terraform proposal could not be generated. Check the Fixer output and sample infrastructure file.")
-
-        if proposal_checks:
-            st.markdown("#### Proposal validation checks")
-            st.dataframe(pd.DataFrame(proposal_checks), use_container_width=True, hide_index=True)
-        if proposal_errors:
-            st.error("The proposal has errors and cannot be approved.")
-            st.dataframe(pd.DataFrame(proposal_errors), use_container_width=True, hide_index=True)
-        if not alignment_ok:
-            st.warning("Approval is blocked because CSV and Terraform data alignment did not pass. Resolve the mismatch before approving.")
-        if proposal_checks and not proposal_checks_ok:
-            st.warning("Approval is blocked because one or more proposal checks did not pass.")
-
-        if proposal_ok:
-            with st.form("greenops_human_approval_form", clear_on_submit=False):
-                reviewer = st.text_input("Reviewer name", placeholder="Enter the person reviewing this change")
-                decision_label = st.radio(
-                    "Decision", ["Approve proposal", "Reject proposal"], horizontal=True,
-                )
-                reason = st.text_area(
-                    "Reason / review notes",
-                    placeholder="Explain why this change is safe or why it should be rejected.",
-                )
-                submitted = st.form_submit_button("Record human decision", type="primary")
-            if submitted:
-                if not reviewer.strip() or not reason.strip():
-                    st.error("Enter your name and a reason before recording the decision.")
-                else:
-                    decision_value = "approved" if decision_label == "Approve proposal" else "rejected"
-                    approval_record = record_decision(
-                        proposed_diff=proposal_diff,
-                        reviewer=reviewer,
-                        decision=decision_value,
-                        reason=reason,
-                    )
-                    st.session_state["greenops_approval"] = approval_record
-                    st.session_state["greenops_approval_diff"] = proposal_diff
-                    st.session_state["greenops_approval_status"] = decision_value
-                    st.session_state.pop("greenops_approved_patch", None)
-                    st.rerun()
-
-            saved_approval = st.session_state.get("greenops_approval")
-            approval_is_current = (
-                st.session_state.get("greenops_approval_diff") == proposal_diff
-                and approval_matches(proposal_diff, saved_approval)
-            )
-            saved_status = st.session_state.get("greenops_approval_status")
-            if approval_is_current and saved_status == "approved":
-                st.success(f"Approved by {saved_approval.reviewer} at {saved_approval.decided_at_utc}.")
-                st.caption(f"Review note: {saved_approval.reason}")
-                if st.button("Export approved patch", type="primary", key="export_approved_patch"):
-                    output_path = PROJECT_ROOT / "artifacts" / f"greenops_approved_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.patch"
-                    result = export_with_approval(proposal_diff, str(output_path), saved_approval)
-                    if result.status == "passed":
-                        st.session_state["greenops_approved_patch"] = proposal_diff
-                        st.session_state["greenops_export_message"] = result.message
-                    else:
-                        st.session_state["greenops_export_message"] = result.message
-                    st.rerun()
-                if st.session_state.get("greenops_approved_patch"):
-                    st.success(st.session_state.get("greenops_export_message", "Approved patch exported."))
-                    st.download_button(
-                        "Download approved patch",
-                        data=st.session_state["greenops_approved_patch"].encode("utf-8"),
-                        file_name="greenops_approved.patch",
-                        mime="text/plain",
-                        key="download_approved_patch",
-                    )
-                    st.caption("This is a patch file only. It has not been applied to any infrastructure.")
-            elif approval_is_current and saved_status == "rejected":
-                st.error(f"Proposal rejected by {saved_approval.reviewer}.")
-                st.caption(f"Review note: {saved_approval.reason}. No patch was exported.")
-            elif saved_approval is not None:
-                st.info("The previous decision does not match the current proposal. Review and record a new decision.")
-        else:
-            st.info("Human approval is disabled until the proposal and data-alignment checks pass.")
     else:
         st.success("No optimization recommendations were generated for this run.")
         st.caption("This may mean no eligible findings were found, or safety checks blocked changes.")
