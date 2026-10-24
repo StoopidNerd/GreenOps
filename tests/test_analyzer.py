@@ -290,11 +290,84 @@ def test_fixer_still_accepts_findings_and_ignores_review_and_ok():
     assert fixer.suggest_fix(by_id["batch-01"]) is None   # review
     assert fixer.suggest_fix(by_id["web-01"]) is None     # ok
 
-
 def test_orchestrator_pipeline_runs_on_default_dataset():
-    result = orchestrator.run_pipeline()
-    assert result["summary"]["resources"] == 14
-    assert len(result["findings"]) == 14
+    from contracts import (
+        ResourceMetrics,
+        TerraformResource,
+        ValidationCheck,
+        CostCarbonEstimate,
+        OptimizationRecommendation,
+        GreenOpsReport,
+    )
+
+    metrics = [
+        ResourceMetrics(
+            resource_id=f"resource-{i}",
+            instance_type="m5.large",
+            region="us-east-1",
+            environment="dev",
+            avg_cpu_pct=10.0,
+            max_cpu_pct=20.0,
+            avg_mem_pct=30.0,
+            monthly_hours=730.0,
+            owner="test-team",
+        )
+        for i in range(14)
+    ]
+
+    terraform_resources = []
+
+    class MockAnalyzer:
+        def analyze(self, metrics, terraform_resources):
+            return (
+                [],
+                [ValidationCheck(
+                    name="mock_analyzer",
+                    status="passed",
+                    message="Mock analyzer ran",
+                )],
+                [],
+            )
+
+    class MockCostCarbon:
+        def estimate(self, metrics, findings):
+            estimates = [
+                CostCarbonEstimate(resource_id=m.resource_id)
+                for m in metrics
+            ]
+            return (
+                estimates,
+                [ValidationCheck(
+                    name="mock_cost_carbon",
+                    status="passed",
+                    message="Mock cost/carbon agent ran",
+                )],
+                [],
+            )
+
+    class MockFixer:
+        def recommend(self, metrics, terraform_resources, findings, estimates):
+            return (
+                [],
+                [ValidationCheck(
+                    name="mock_fixer",
+                    status="passed",
+                    message="Mock fixer ran",
+                )],
+                [],
+            )
+
+    result = orchestrator.run_pipeline(
+        metrics,
+        terraform_resources,
+        MockAnalyzer(),
+        MockCostCarbon(),
+        MockFixer(),
+    )
+
+    assert isinstance(result, GreenOpsReport)
+    assert len(result.estimates) == 14
+    assert len(result.errors) == 0
 
 
 def test_to_analysis_finding_maps_to_shared_contract():

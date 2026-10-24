@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import List, Optional, Protocol, Tuple
+from typing import List, Protocol, Tuple
 
 # Make the project root importable when this module is run from VS Code.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -78,13 +78,17 @@ def _validate_agent_result(result, agent_name: str):
         raise TypeError(
             f"{agent_name} must return (results, validation_checks, errors)."
         )
+
     results, checks, errors = result
     if not isinstance(results, list) or not isinstance(checks, list) or not isinstance(errors, list):
-        raise TypeError(f"{agent_name} must return lists in all three tuple positions.")
+        raise TypeError(
+            f"{agent_name} must return lists in all three tuple positions."
+        )
     if not all(isinstance(item, ValidationCheck) for item in checks):
         raise TypeError(f"{agent_name} returned an invalid validation-check item.")
     if not all(isinstance(item, AgentError) for item in errors):
         raise TypeError(f"{agent_name} returned an invalid error item.")
+
     return results, checks, errors
 
 
@@ -103,36 +107,37 @@ def run_pipeline(
 ) -> GreenOpsReport:
     """Run the GreenOps pipeline and return one consolidated report.
 
-    Args:
-        metrics: Per-resource metrics, normally loaded from
-            ``data/utilisation_backup.csv`` for current sample testing.
-        terraform_resources: Parsed resource details from the sample Terraform
-            file. Resource IDs should match the metrics' resource IDs.
-        analyzer_agent: Implementation of ``AnalyzerInterface``.
-        cost_carbon_agent: Implementation of ``CostCarbonInterface``.
-        fixer_agent: Implementation of ``FixerInterface``.
-
     Any agent exception is captured in the report. If an upstream stage fails,
     dependent stages are skipped instead of being called with misleading data.
     No infrastructure action is performed.
     """
     report = GreenOpsReport()
 
-    # Basic input validation prevents ambiguous IDs from silently overwriting
-    # each other in downstream agents.
-    metric_ids = [m.resource_id for m in metrics]
-    terraform_ids = [t.resource_id for t in terraform_resources]
-    duplicate_metric_ids = sorted({rid for rid in metric_ids if metric_ids.count(rid) > 1})
-    duplicate_terraform_ids = sorted({rid for rid in terraform_ids if terraform_ids.count(rid) > 1})
+    # Reject duplicate IDs before downstream agents could confuse resources.
+    metric_ids = [metric.resource_id for metric in metrics]
+    terraform_ids = [resource.resource_id for resource in terraform_resources]
+    duplicate_metric_ids = sorted(
+        {resource_id for resource_id in metric_ids if metric_ids.count(resource_id) > 1}
+    )
+    duplicate_terraform_ids = sorted(
+        {resource_id for resource_id in terraform_ids if terraform_ids.count(resource_id) > 1}
+    )
 
     if duplicate_metric_ids:
         message = "Duplicate resource IDs in metrics: " + ", ".join(duplicate_metric_ids)
         report.errors.append(AgentError(agent="orchestrator", message=message))
         report.validation_checks.append(
-            ValidationCheck(name="input_metrics_unique_ids", status="failed", message=message)
+            ValidationCheck(
+                name="input_metrics_unique_ids", status="failed", message=message
+            )
         )
-        _add_skipped(report, "pipeline", "Pipeline stopped because metrics contain duplicate resource IDs.")
+        _add_skipped(
+            report,
+            "pipeline",
+            "Pipeline stopped because metrics contain duplicate resource IDs.",
+        )
         return report
+
     report.validation_checks.append(
         ValidationCheck(
             name="input_metrics_unique_ids",
@@ -145,10 +150,17 @@ def run_pipeline(
         message = "Duplicate resource IDs in Terraform resources: " + ", ".join(duplicate_terraform_ids)
         report.errors.append(AgentError(agent="orchestrator", message=message))
         report.validation_checks.append(
-            ValidationCheck(name="input_terraform_unique_ids", status="failed", message=message)
+            ValidationCheck(
+                name="input_terraform_unique_ids", status="failed", message=message
+            )
         )
-        _add_skipped(report, "pipeline", "Pipeline stopped because Terraform resources contain duplicate resource IDs.")
+        _add_skipped(
+            report,
+            "pipeline",
+            "Pipeline stopped because Terraform resources contain duplicate resource IDs.",
+        )
         return report
+
     report.validation_checks.append(
         ValidationCheck(
             name="input_terraform_unique_ids",
@@ -164,25 +176,42 @@ def run_pipeline(
         )
         if not all(isinstance(item, AnalysisFinding) for item in findings):
             raise TypeError("Analyzer returned an item that is not an AnalysisFinding.")
+
         report.findings.extend(findings)
         report.validation_checks.extend(checks)
         report.errors.extend(errors)
+        analyzer_failed = bool(errors) or any(check.status == "failed" for check in checks)
         report.validation_checks.append(
             ValidationCheck(
                 name="analyzer_stage",
-                status="passed" if not errors and not any(c.status == "failed" for c in checks) else "failed",
+                status="failed" if analyzer_failed else "passed",
                 message=f"Analyzer returned {len(findings)} finding(s).",
             )
         )
-        if errors or any(c.status == "failed" for c in checks):
-            _add_skipped(report, "cost_carbon_stage", "Skipped because Analyzer reported errors or failed checks.")
-            _add_skipped(report, "fixer_stage", "Skipped because Analyzer reported errors or failed checks.")
-            report.notes.append("Review Analyzer errors and validation checks before rerunning the pipeline.")
+
+        if analyzer_failed:
+            _add_skipped(
+                report,
+                "cost_carbon_stage",
+                "Skipped because Analyzer reported errors or failed checks.",
+            )
+            _add_skipped(
+                report,
+                "fixer_stage",
+                "Skipped because Analyzer reported errors or failed checks.",
+            )
+            report.notes.append(
+                "Review Analyzer errors and validation checks before rerunning the pipeline."
+            )
             return report
     except Exception as exc:
         _agent_failure(report, "analyzer", exc, "analyzer_stage")
-        _add_skipped(report, "cost_carbon_stage", "Skipped because Analyzer did not complete successfully.")
-        _add_skipped(report, "fixer_stage", "Skipped because Analyzer did not complete successfully.")
+        _add_skipped(
+            report, "cost_carbon_stage", "Skipped because Analyzer did not complete successfully."
+        )
+        _add_skipped(
+            report, "fixer_stage", "Skipped because Analyzer did not complete successfully."
+        )
         return report
 
     # Stage 2: estimate cost and carbon for analyzed resources.
@@ -192,26 +221,41 @@ def run_pipeline(
         )
         if not all(isinstance(item, CostCarbonEstimate) for item in estimates):
             raise TypeError("Cost & Carbon agent returned an invalid estimate item.")
+
         report.estimates.extend(estimates)
         report.validation_checks.extend(checks)
         report.errors.extend(errors)
+        cost_carbon_failed = bool(errors) or any(
+            check.status == "failed" for check in checks
+        )
         report.validation_checks.append(
             ValidationCheck(
                 name="cost_carbon_stage",
-                status="passed" if not errors and not any(c.status == "failed" for c in checks) else "failed",
+                status="failed" if cost_carbon_failed else "passed",
                 message=f"Cost & Carbon agent returned {len(estimates)} estimate(s).",
             )
         )
-        if errors or any(c.status == "failed" for c in checks):
-            _add_skipped(report, "fixer_stage", "Skipped because Cost & Carbon agent reported errors or failed checks.")
-            report.notes.append("Review Cost & Carbon errors and validation checks before generating recommendations.")
+
+        if cost_carbon_failed:
+            _add_skipped(
+                report,
+                "fixer_stage",
+                "Skipped because Cost & Carbon agent reported errors or failed checks.",
+            )
+            report.notes.append(
+                "Review Cost & Carbon errors and validation checks before generating recommendations."
+            )
             return report
     except Exception as exc:
         _agent_failure(report, "cost_carbon", exc, "cost_carbon_stage")
-        _add_skipped(report, "fixer_stage", "Skipped because Cost & Carbon estimates were not produced successfully.")
+        _add_skipped(
+            report,
+            "fixer_stage",
+            "Skipped because Cost & Carbon estimates were not produced successfully.",
+        )
         return report
 
-    # Stage 3: generate recommendations. The Fixer must remain advisory only.
+    # Stage 3: generate advisory recommendations. No changes are applied.
     try:
         recommendations, checks, errors = _validate_agent_result(
             fixer_agent.recommend(
@@ -222,16 +266,45 @@ def run_pipeline(
             ),
             "fixer",
         )
-        if not all(isinstance(item, OptimizationRecommendation) for item in recommendations):
+        if not all(
+            isinstance(item, OptimizationRecommendation) for item in recommendations
+        ):
             raise TypeError("Fixer returned an invalid recommendation item.")
+
         report.recommendations.extend(recommendations)
         report.validation_checks.extend(checks)
         report.errors.extend(errors)
+
+        # A missing Terraform match is an expected safety skip. Keep its error
+        # and failed terraform_match check in the report, but don't confuse it
+        # with a Fixer execution failure. Other errors/check failures still block.
+        safe_skip_errors = [
+            error
+            for error in errors
+            if error.agent == "fixer"
+            and error.message.startswith("No matching Terraform resource")
+        ]
+        blocking_errors = [error for error in errors if error not in safe_skip_errors]
+        blocking_failures = [
+            check
+            for check in checks
+            if check.status == "failed" and check.name != "terraform_match"
+        ]
+        missing_match_count = sum(
+            check.name == "terraform_match" and check.status == "failed"
+            for check in checks
+        )
+
+        fixer_failed = bool(blocking_errors) or bool(blocking_failures)
         report.validation_checks.append(
             ValidationCheck(
                 name="fixer_stage",
-                status="passed" if not errors and not any(c.status == "failed" for c in checks) else "failed",
-                message=f"Fixer returned {len(recommendations)} recommendation(s). No changes were applied.",
+                status="failed" if fixer_failed else "passed",
+                message=(
+                    f"Fixer returned {len(recommendations)} recommendation(s); "
+                    f"{missing_match_count} resource(s) were skipped because no "
+                    "Terraform match was found. No changes were applied."
+                ),
             )
         )
     except Exception as exc:

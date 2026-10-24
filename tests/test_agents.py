@@ -35,11 +35,123 @@ class TestFixer(unittest.TestCase):
         self.assertIsNone(fixer.next_smaller("m5.large"))
 
 
+
 class TestOrchestrator(unittest.TestCase):
     def test_pipeline_runs(self):
-        result = orchestrator.run_pipeline()
-        self.assertIn("summary", result)
-        self.assertEqual(result["summary"]["resources"], len(result["findings"]))
+        from contracts import (
+            AgentError,
+            AnalysisFinding,
+            CostCarbonEstimate,
+            OptimizationRecommendation,
+            ResourceMetrics,
+            TerraformResource,
+            ValidationCheck,
+            GreenOpsReport,
+        )
+
+        metrics = [
+            ResourceMetrics(
+                resource_id="web-01",
+                instance_type="m5.xlarge",
+                region="us-east-1",
+                environment="dev",
+                avg_cpu_pct=10.0,
+                max_cpu_pct=30.0,
+                avg_mem_pct=20.0,
+                monthly_hours=730,
+                owner="platform-team",
+            )
+        ]
+
+        terraform_resources = [
+            TerraformResource(
+                resource_address="aws_instance.web_01",
+                resource_id="web-01",
+                instance_type="m5.xlarge",
+                region="us-east-1",
+                environment="dev",
+                owner="platform-team",
+            )
+        ]
+
+        class MockAnalyzer:
+            def analyze(self, metrics, terraform_resources):
+                findings = [
+                    AnalysisFinding(
+                        resource_id="web-01",
+                        finding_type="underused",
+                        severity="medium",
+                        message="Low average utilization",
+                        evidence={"avg_cpu_pct": 10.0},
+                    )
+                ]
+                return findings, [
+                    ValidationCheck(
+                        name="mock_analyzer",
+                        status="passed",
+                        message="Mock Analyzer completed",
+                    )
+                ], []
+
+        class MockCostCarbon:
+            def estimate(self, metrics, findings):
+                estimates = [
+                    CostCarbonEstimate(
+                        resource_id="web-01",
+                        monthly_cost_usd=140.16,
+                        monthly_energy_kwh=24.82,
+                        monthly_carbon_kg=9.43,
+                        assumptions=["Synthetic test estimates"],
+                    )
+                ]
+                return estimates, [
+                    ValidationCheck(
+                        name="mock_cost_carbon",
+                        status="passed",
+                        message="Mock Cost & Carbon completed",
+                    )
+                ], []
+
+        class MockFixer:
+            def recommend(
+                self, metrics, terraform_resources, findings, estimates
+            ):
+                recommendations = [
+                    OptimizationRecommendation(
+                        resource_id="web-01",
+                        current_instance_type="m5.xlarge",
+                        suggested_instance_type="m5.large",
+                        reason="Synthetic test recommendation",
+                        estimated_monthly_savings_usd=70.08,
+                        estimated_monthly_carbon_reduction_kg=4.5,
+                        requires_human_approval=True,
+                    )
+                ]
+                return recommendations, [
+                    ValidationCheck(
+                        name="mock_fixer",
+                        status="passed",
+                        message="Mock Fixer completed",
+                    )
+                ], []
+
+        result = orchestrator.run_pipeline(
+            metrics,
+            terraform_resources,
+            MockAnalyzer(),
+            MockCostCarbon(),
+            MockFixer(),
+        )
+
+        self.assertIsInstance(result, GreenOpsReport)
+        self.assertEqual(len(result.findings), 1)
+        self.assertEqual(len(result.estimates), 1)
+        self.assertEqual(len(result.recommendations), 1)
+        self.assertEqual(
+            result.recommendations[0].suggested_instance_type,
+            "m5.large",
+        )
+        self.assertEqual(result.errors, [])
 
 
 if __name__ == "__main__":
