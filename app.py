@@ -1,854 +1,695 @@
-"""GreenOps Stage 6 dashboard.
-
-Uses local synthetic sample data only. This UI displays analysis results and
-recommendations; it does not approve, export, or apply infrastructure changes.
-The Stage 5 approval workflow can be connected here when its interface is merged.
 """
+GreenOps Console - cloud cost, energy and carbon optimizer.
 
-from __future__ import annotations
-
+Run:  streamlit run app.py
+"""
+import hashlib
+import io
 import json
+import time
 from datetime import datetime
-from pathlib import Path
-from typing import Any
 
+import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
-from agents.orchestrator import report_to_dict
-from agents.runtime import run_sample_pipeline
+st.set_page_config(page_title="GreenOps Console", page_icon="🌿", layout="wide")
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "data"
+# ----------------------------------------------------------------------------
+# Model constants
+# ----------------------------------------------------------------------------
+SIZES = ["small", "medium", "large", "xlarge", "2xlarge"]
+VCPU = [2, 4, 8, 16, 32]
+PRICE_PER_VCPU_HR = 0.048          # USD, x86, baseline region
+ARM_PRICE_FACTOR = 0.80            # ARM is ~20% cheaper
+ARM_POWER_FACTOR = 0.75            # ARM draws ~25% less power
+PUE = 1.25                         # datacenter overhead
+FULL_MONTH_HOURS = 730.0
+
+# region: (grid carbon intensity kgCO2/kWh, price multiplier)
+REGIONS = {
+    "us-east-1 (Virginia)": (0.38, 1.00),
+    "us-west-2 (Oregon)": (0.12, 1.00),
+    "eu-north-1 (Stockholm)": (0.02, 1.05),
+    "eu-west-1 (Ireland)": (0.30, 1.08),
+    "ap-south-1 (Mumbai)": (0.71, 0.97),
+    "ap-southeast-1 (Singapore)": (0.49, 1.10),
+}
+
+FIXES = {
+    "terminate": dict(label="Terminate idle", icon="🗑️", risk="Low", effort="Low", color="#ef4444"),
+    "rightsize": dict(label="Rightsize", icon="📐", risk="Medium", effort="Medium", color="#f59e0b"),
+    "schedule": dict(label="Off-hours schedule", icon="⏰", risk="Low", effort="Low", color="#3b82f6"),
+    "arm": dict(label="Move to ARM", icon="🧬", risk="Medium", effort="Medium", color="#8b5cf6"),
+    "region": dict(label="Greener region", icon="🌍", risk="High", effort="High", color="#10b981"),
+}
+PIPELINE_ORDER = ["rightsize", "schedule", "arm", "region"]
 
 
-st.set_page_config(
-    page_title="GreenOps | Cloud Sustainability",
-    page_icon="🌱",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# A restrained visual style: readable cards, clear hierarchy, and no false
-# implication that a recommendation has been approved or applied.
+# ----------------------------------------------------------------------------
+# Styling
+# ----------------------------------------------------------------------------
 st.markdown(
     """
-    <style>
-      .block-container {padding-top: 1.6rem; padding-bottom: 2.5rem; max-width: 1500px;}
-      .greenops-eyebrow {font-size: .78rem; font-weight: 700; letter-spacing: .12em;
-                         text-transform: uppercase; color: #198754; margin-bottom: .3rem;}
-      .greenops-subtitle {color: #64748b; font-size: 1rem; margin-top: -.4rem;}
-      div[data-testid="stMetric"] {border: 1px solid rgba(128,128,128,.22);
-          padding: 14px 16px; border-radius: 14px; background: rgba(128,128,128,.035);}
-      .greenops-note {border-left: 4px solid #198754; padding: .7rem 1rem;
-          background: rgba(25,135,84,.07); border-radius: 0 8px 8px 0;}
-    </style>
-    """,
+<style>
+.block-container {padding-top: 1.4rem; max-width: 1350px;}
+.hero {
+  background: linear-gradient(120deg, #064e3b 0%, #047857 45%, #0ea5a4 100%);
+  border-radius: 20px; padding: 28px 34px; color: #fff; margin-bottom: 18px;
+  box-shadow: 0 10px 30px rgba(4,120,87,.25);
+}
+.hero h1 {margin: 0; font-size: 2.2rem; letter-spacing: -.5px; color:#fff;}
+.hero p {margin: 6px 0 0 0; opacity: .92; font-size: 1.02rem; color:#fff;}
+.pill {display:inline-block; padding:3px 12px; border-radius:999px; background:rgba(255,255,255,.18);
+       font-size:.78rem; margin-right:8px; margin-top:12px; color:#fff;}
+.kpi {border-radius: 18px; padding: 18px 20px; color: #fff; height: 100%;
+      box-shadow: 0 6px 18px rgba(0,0,0,.14);}
+.kpi .t {font-size:.82rem; text-transform:uppercase; letter-spacing:1px; opacity:.85;}
+.kpi .v {font-size:2rem; font-weight:800; line-height:1.15; margin-top:4px;}
+.kpi .s {font-size:.86rem; opacity:.92; margin-top:4px;}
+.k-green  {background: linear-gradient(135deg,#059669,#34d399);}
+.k-blue   {background: linear-gradient(135deg,#1d4ed8,#38bdf8);}
+.k-amber  {background: linear-gradient(135deg,#d97706,#fbbf24);}
+.k-slate  {background: linear-gradient(135deg,#334155,#64748b);}
+.k-violet {background: linear-gradient(135deg,#6d28d9,#a78bfa);}
+.rec {border-radius:16px; padding:16px 18px; border:1px solid rgba(128,128,128,.28);
+      border-left-width:6px; background: rgba(128,128,128,.07); height:100%;}
+.rec .h {font-weight:700; font-size:1.02rem;}
+.rec .d {opacity:.85; font-size:.88rem; margin:4px 0 10px 0;}
+.rec .m {font-size:.88rem;}
+.tag {display:inline-block; padding:2px 10px; border-radius:999px; font-size:.72rem; font-weight:600;
+      margin-right:6px; color:#fff;}
+.tag-Low {background:#16a34a;} .tag-Medium {background:#d97706;} .tag-High {background:#dc2626;}
+.banner {border-radius:14px; padding:14px 18px; margin:6px 0 14px 0; font-weight:600;}
+.banner-ok {background:rgba(16,185,129,.15); border:1px solid #10b981;}
+.banner-info {background:rgba(59,130,246,.13); border:1px solid #3b82f6;}
+.cta {border-radius:18px; padding:34px; text-align:center; border:2px dashed rgba(16,185,129,.55);
+      background:rgba(16,185,129,.07); margin: 8px 0 18px 0;}
+.cta h3 {margin:0 0 6px 0;}
+div[data-testid="stTabs"] button {font-weight:600; font-size:1rem;}
+</style>
+""",
     unsafe_allow_html=True,
 )
 
 
-def as_records(value: Any) -> list[dict]:
-    """Return a list of dictionary rows, tolerating absent/invalid report fields."""
-    if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
+# ----------------------------------------------------------------------------
+# Core calculations
+# ----------------------------------------------------------------------------
+def calc(vcpu, arch, region, hours, load):
+    """Return (monthly cost USD, kWh, kgCO2) for a resource state."""
+    util = min(load / vcpu, 0.98)
+    watts = vcpu * (2.5 + 6.5 * util) * (ARM_POWER_FACTOR if arch == "arm" else 1.0)
+    kwh = watts * hours / 1000.0 * PUE
+    intensity, price_mult = REGIONS[region]
+    cost = vcpu * PRICE_PER_VCPU_HR * (ARM_PRICE_FACTOR if arch == "arm" else 1.0) * price_mult * hours
+    return cost, kwh, kwh * intensity
 
 
-def number(value: Any) -> float | None:
-    """Convert a report value to a finite float, or None when unavailable."""
-    if isinstance(value, bool) or value is None:
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if pd.notna(parsed) else None
+def eligible(r, cfg):
+    """Which fixes apply to this resource, with their parameters."""
+    if r["cpu_avg"] < cfg["idle_thr"] and r["cpu_peak"] < cfg["idle_thr"] * 3:
+        return {"terminate": {}}
+    out = {}
+    idx = SIZES.index(r["instance_size"])
+    peak_load = r["cpu_peak"] / 100 * VCPU[idx]
+    for j in range(idx):
+        if peak_load / VCPU[j] <= cfg["headroom"] / 100:
+            out["rightsize"] = {"to": j}
+            break
+    if r["env"] in ("dev", "test", "staging") and r["hours"] >= 700:
+        out["schedule"] = {"hours": cfg["sched_hours"] * 52 / 12}
+    if r["arch"] == "x86":
+        out["arm"] = {}
+    ri = REGIONS[r["region"]][0]
+    ti = REGIONS[cfg["green_region"]][0]
+    if r["region"] != cfg["green_region"] and ri >= 0.25 and ri >= 2 * ti:
+        out["region"] = {"to": cfg["green_region"]}
+    return out
 
 
-def total(rows: list[dict], field: str) -> float:
-    return sum(number(row.get(field)) or 0.0 for row in rows)
+def run_pipeline(r, params, chosen):
+    """Apply chosen fixes in order. Returns (base, final, per-fix deltas)."""
+    vc = VCPU[SIZES.index(r["instance_size"])]
+    s = dict(vcpu=vc, arch=r["arch"], region=r["region"], hours=r["hours"], load=r["cpu_avg"] / 100 * vc)
+    base = calc(**s)
+    if "terminate" in chosen:
+        return base, (0.0, 0.0, 0.0), {"terminate": base}
+    cur, deltas = base, {}
+    for fix in PIPELINE_ORDER:
+        if fix in chosen:
+            p = params[fix]
+            if fix == "rightsize":
+                s["vcpu"] = VCPU[p["to"]]
+            elif fix == "schedule":
+                s["hours"] = p["hours"]
+            elif fix == "arm":
+                s["arch"] = "arm"
+            elif fix == "region":
+                s["region"] = p["to"]
+            new = calc(**s)
+            deltas[fix] = tuple(a - b for a, b in zip(cur, new))
+            cur = new
+    return base, cur, deltas
 
 
-def money(value: float | None) -> str:
-    return "—" if value is None else f"${value:,.2f}"
+def detail_text(fix, r, p, cfg):
+    if fix == "terminate":
+        return f"Decommission (avg CPU {r['cpu_avg']:.0f}%, peak {r['cpu_peak']:.0f}%)"
+    if fix == "rightsize":
+        return f"{r['instance_size']} → {SIZES[p['to']]} (peak {r['cpu_peak']:.0f}% CPU)"
+    if fix == "schedule":
+        return f"Run {cfg['sched_hours']} h/week, stop nights & weekends"
+    if fix == "arm":
+        return "Migrate x86 → ARM (Graviton-class)"
+    return f"{r['region']} → {p['to']}"
 
 
-def decimal(value: float | None, suffix: str = "") -> str:
-    return "—" if value is None else f"{value:,.2f}{suffix}"
-
-
-def flatten_findings(findings: list[dict]) -> list[dict]:
-    flattened = []
-    for item in findings:
-        evidence = item.get("evidence")
-        evidence = evidence if isinstance(evidence, dict) else {}
-        flattened.append(
-            {
-                "Resource": item.get("resource_id", "—"),
-                "Finding": item.get("finding_type", "—"),
-                "Severity": item.get("severity", "—"),
-                "Environment": evidence.get("environment", "—"),
-                "Instance type": evidence.get("instance_type", "—"),
-                "Avg CPU (%)": evidence.get("avg_cpu_pct"),
-                "Peak CPU (%)": evidence.get("max_cpu_pct"),
-                "Avg memory (%)": evidence.get("avg_mem_pct"),
-                "Owner": evidence.get("owner", "—"),
-                "Explanation": item.get("message", ""),
-            }
-        )
-    return flattened
-
-
-def flatten_estimates(estimates: list[dict]) -> list[dict]:
-    return [
-        {
-            "Resource": item.get("resource_id", "—"),
-            "Monthly cost (USD)": item.get("monthly_cost_usd"),
-            "Energy (kWh/month)": item.get("monthly_energy_kwh"),
-            "Carbon (kg CO₂e/month)": item.get("monthly_carbon_kg"),
-            "Assumptions": "; ".join(item.get("assumptions") or []),
-        }
-        for item in estimates
-    ]
-
-
-def flatten_recommendations(recommendations: list[dict]) -> list[dict]:
+def build_recs(df, cfg):
     rows = []
-    for item in recommendations:
-        requires_approval = item.get("requires_human_approval", True)
+    for r in df.to_dict("records"):
+        params = eligible(r, cfg)
+        if not params:
+            continue
+        _, _, deltas = run_pipeline(r, params, set(params))
+        for fix, (dc, dk, dco) in deltas.items():
+            rows.append(
+                dict(
+                    id=f"{r['name']}|{fix}",
+                    resource=r["name"],
+                    env=r["env"],
+                    fix=fix,
+                    action=f"{FIXES[fix]['icon']} {FIXES[fix]['label']}",
+                    detail=detail_text(fix, r, params[fix], cfg),
+                    cost=dc,
+                    kwh=dk,
+                    co2=dco,
+                    risk=FIXES[fix]["risk"],
+                    effort=FIXES[fix]["effort"],
+                )
+            )
+    recs = pd.DataFrame(rows)
+    if recs.empty:
+        return recs
+    recs = recs.sort_values("cost", ascending=False).reset_index(drop=True)
+    n = len(recs)
+    recs["priority"] = ["High" if i < n * 0.2 else "Medium" if i < n * 0.5 else "Low" for i in range(n)]
+    return recs
+
+
+def evaluate(df, cfg, sel):
+    """Simulate the fleet with the selected fixes applied."""
+    res, by_fix = [], {f: np.zeros(3) for f in FIXES}
+    for r in df.to_dict("records"):
+        params = eligible(r, cfg)
+        chosen = {f for f in params if f"{r['name']}|{f}" in sel}
+        base, final, deltas = run_pipeline(r, params, chosen)
+        for f, d in deltas.items():
+            by_fix[f] += np.array(d)
+        res.append(
+            dict(
+                name=r["name"], env=r["env"], region=r["region"], instance_size=r["instance_size"],
+                arch=r["arch"], cpu_avg=r["cpu_avg"], cpu_peak=r["cpu_peak"],
+                cost_now=base[0], cost_opt=final[0], kwh_now=base[1], kwh_opt=final[1],
+                co2_now=base[2], co2_opt=final[2],
+                fixes=", ".join(FIXES[f]["label"] for f in PIPELINE_ORDER + ["terminate"] if f in chosen) or "—",
+                status="Idle" if "terminate" in params else ("Optimizable" if params else "Healthy"),
+            )
+        )
+    out = pd.DataFrame(res)
+    totals = dict(
+        cost_now=out.cost_now.sum(), cost_opt=out.cost_opt.sum(),
+        kwh_now=out.kwh_now.sum(), kwh_opt=out.kwh_opt.sum(),
+        co2_now=out.co2_now.sum(), co2_opt=out.co2_opt.sum(),
+    )
+    return out, totals, by_fix
+
+
+# ----------------------------------------------------------------------------
+# Data
+# ----------------------------------------------------------------------------
+def sample_fleet(seed, n=48):
+    rng = np.random.default_rng(seed)
+    teams = ["checkout", "search", "ml-train", "etl", "api", "web", "billing", "auth", "reports", "queue"]
+    rows = []
+    for i in range(n):
+        env = rng.choice(["prod", "staging", "dev", "test"], p=[0.35, 0.15, 0.30, 0.20])
+        kind = rng.choice(["idle", "over", "ok"], p=[0.15, 0.35, 0.50])
+        if kind == "idle":
+            avg, peak = rng.uniform(0.8, 4.0), rng.uniform(3, 12)
+        elif kind == "over":
+            avg, peak = rng.uniform(6, 18), rng.uniform(15, 34)
+        else:
+            avg, peak = rng.uniform(30, 60), rng.uniform(58, 92)
         rows.append(
+            dict(
+                name=f"{rng.choice(teams)}-{env}-{i:02d}",
+                env=str(env),
+                region=str(rng.choice(list(REGIONS), p=[0.30, 0.12, 0.05, 0.13, 0.25, 0.15])),
+                instance_size=str(rng.choice(SIZES, p=[0.10, 0.25, 0.30, 0.22, 0.13])),
+                arch=str(rng.choice(["x86", "arm"], p=[0.85, 0.15])),
+                cpu_avg=round(float(avg), 1),
+                cpu_peak=round(float(max(peak, avg + 1)), 1),
+                hours=FULL_MONTH_HOURS,
+            )
+        )
+    return pd.DataFrame(rows)
+
+
+def parse_upload(raw: bytes):
+    df = pd.read_csv(io.BytesIO(raw))
+    need = {"name", "env", "region", "instance_size", "cpu_avg", "cpu_peak"}
+    missing = need - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {', '.join(sorted(missing))}")
+    if "arch" not in df:
+        df["arch"] = "x86"
+    if "hours" not in df:
+        df["hours"] = FULL_MONTH_HOURS
+    df["region"] = df["region"].where(df["region"].isin(REGIONS), "us-east-1 (Virginia)")
+    df = df[df["instance_size"].isin(SIZES)].copy()
+    df["env"] = df["env"].astype(str).str.lower()
+    df["arch"] = df["arch"].astype(str).str.lower().where(lambda s: s.isin(["x86", "arm"]), "x86")
+    if df.empty:
+        raise ValueError(f"No valid rows. instance_size must be one of {SIZES}.")
+    return df.reset_index(drop=True)
+
+
+# ----------------------------------------------------------------------------
+# Session state
+# ----------------------------------------------------------------------------
+ss = st.session_state
+ss.setdefault("seed", 7)
+ss.setdefault("analysis", None)
+ss.setdefault("applied", None)
+ss.setdefault("sel_base", set())
+ss.setdefault("editor_ver", 0)
+ss.setdefault("run_requested", False)
+
+
+def request_run():
+    ss.run_requested = True
+
+
+def new_fleet():
+    ss.seed += 1
+
+
+def current_selection():
+    a = ss.analysis
+    if a is None:
+        return set()
+    ids = a["plan_ids"]
+    sel = set(ss.sel_base)
+    edits = ss.get(f"editor_{a['run']}_{ss.editor_ver}", {}).get("edited_rows", {})
+    for pos, change in edits.items():
+        if "Apply" in change and int(pos) < len(ids):
+            (sel.add if change["Apply"] else sel.discard)(ids[int(pos)])
+    return sel
+
+
+def select_all():
+    ss.sel_base = set(ss.analysis["plan_ids"])
+    ss.editor_ver += 1
+
+
+def clear_all():
+    ss.sel_base = set()
+    ss.editor_ver += 1
+
+
+def apply_plan():
+    ss.applied = set(current_selection())
+    ss.toast_msg = "✅ Fix plan applied - savings are now realized."
+
+
+def revert_plan():
+    ss.sel_base = set(ss.applied or [])
+    ss.applied = None
+    ss.editor_ver += 1
+
+
+# ----------------------------------------------------------------------------
+# Sidebar
+# ----------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown("## 🌿 GreenOps")
+    st.caption("Configure the fleet and the optimization rules, then run the analysis.")
+
+    st.markdown("### 1 · Fleet data")
+    source = st.radio("Source", ["Sample fleet", "Upload CSV"], horizontal=True, label_visibility="collapsed")
+    uploaded = None
+    if source == "Sample fleet":
+        c1, c2 = st.columns([3, 2])
+        c1.caption(f"Telemetry seed: **{ss.seed}**")
+        c2.button("🔄 New", on_click=new_fleet, help="Generate a different sample fleet", width="stretch")
+    else:
+        uploaded = st.file_uploader("CSV", type="csv", label_visibility="collapsed")
+        tpl = sample_fleet(1, 6).to_csv(index=False)
+        st.download_button("⬇ CSV template", tpl, "fleet_template.csv", "text/csv", width="stretch")
+
+    st.markdown("### 2 · Optimization rules")
+    idle_thr = st.slider("Idle if avg CPU below (%)", 1, 15, 5)
+    headroom = st.slider("Rightsize: max peak load after resize (%)", 50, 90, 70)
+    sched_hours = st.slider("Dev/test run hours per week", 30, 100, 60)
+    green_region = st.selectbox("Preferred green region", list(REGIONS), index=2)
+
+    st.markdown("### 3 · Display")
+    currency = st.radio("Currency", ["USD ($)", "INR (₹)"], horizontal=True)
+    fx = 1.0
+    sym = "$"
+    if currency.startswith("INR"):
+        sym = "₹"
+        fx = st.number_input("INR per USD", 50.0, 150.0, 85.0, 0.5)
+
+    st.divider()
+    st.button("🚀 Run analysis", type="primary", width="stretch", on_click=request_run, key="run_side")
+
+cfg = dict(idle_thr=float(idle_thr), headroom=float(headroom), sched_hours=float(sched_hours), green_region=green_region)
+
+
+def money(usd, dec=0):
+    return f"{sym}{usd * fx:,.{dec}f}"
+
+
+def kwh_fmt(x):
+    return f"{x:,.0f} kWh" if x < 100000 else f"{x / 1000:,.1f} MWh"
+
+
+def co2_fmt(x):
+    return f"{x:,.0f} kg" if x < 10000 else f"{x / 1000:,.1f} t"
+
+
+def kpi(title, value, sub, cls):
+    st.markdown(
+        f'<div class="kpi {cls}"><div class="t">{title}</div><div class="v">{value}</div><div class="s">{sub}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+
+# ----------------------------------------------------------------------------
+# Load fleet
+# ----------------------------------------------------------------------------
+fleet, fleet_sig = None, ""
+if source == "Sample fleet":
+    fleet = sample_fleet(ss.seed)
+    fleet_sig = f"sample-{ss.seed}"
+elif uploaded is not None:
+    raw = uploaded.getvalue()
+    try:
+        fleet = parse_upload(raw)
+        fleet_sig = "csv-" + hashlib.md5(raw).hexdigest()[:10]
+    except Exception as e:  # noqa: BLE001
+        st.sidebar.error(f"CSV problem: {e}")
+
+settings_sig = hashlib.md5((fleet_sig + json.dumps(cfg, sort_keys=True)).encode()).hexdigest()
+
+# ----------------------------------------------------------------------------
+# Hero
+# ----------------------------------------------------------------------------
+st.markdown(
+    """
+<div class="hero">
+  <h1>🌿 GreenOps Console</h1>
+  <p>Cut cloud spend, burn less energy, emit less carbon - find waste, get fixes, see the impact.</p>
+  <span class="pill">💰 Cost</span><span class="pill">⚡ Energy</span>
+  <span class="pill">🌍 Carbon</span><span class="pill">🛠️ Automated fixer</span>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
+if fleet is None:
+    st.info("Upload a fleet CSV in the sidebar (or switch back to the sample fleet) to begin.")
+    st.stop()
+
+# ----------------------------------------------------------------------------
+# Run analysis
+# ----------------------------------------------------------------------------
+if ss.run_requested:
+    ss.run_requested = False
+    with st.status("Running GreenOps analysis…", expanded=True) as status:
+        st.write(f"🔎 Scanning {len(fleet)} resources…")
+        time.sleep(0.5)
+        st.write("📈 Evaluating CPU utilization and idle patterns…")
+        time.sleep(0.5)
+        st.write("🧮 Modelling cost, energy and carbon for each fix…")
+        recs = build_recs(fleet, cfg)
+        time.sleep(0.5)
+        st.write("🛠️ Building fixer recommendations…")
+        time.sleep(0.4)
+        status.update(label=f"Analysis complete - {len(recs)} recommendations found", state="complete", expanded=False)
+    prev = ss.analysis["run"] if ss.analysis else 0
+    ss.analysis = dict(
+        run=prev + 1, ts=datetime.now().strftime("%H:%M:%S"), sig=settings_sig,
+        fleet=fleet.copy(), cfg=dict(cfg), recs=recs, plan_ids=list(recs["id"]) if len(recs) else [],
+    )
+    ss.sel_base = set(ss.analysis["plan_ids"])
+    ss.applied = None
+    ss.editor_ver += 1
+    ss.toast_msg = f"Analysis #{prev + 1} complete: {len(recs)} fixes identified"
+
+if ss.get("toast_msg"):
+    st.toast(ss.pop("toast_msg"))
+
+# Always read analysis results from Streamlit session state.
+A = ss.get("analysis")
+
+# If analysis has not run yet, show the baseline dashboard and stop before
+# accessing analysis-only fields.
+if not isinstance(A, dict):
+    base_df, base_tot, _ = evaluate(fleet, cfg, set())
+    st.markdown(
+        '<div class="cta"><h3>Ready when you are</h3>'
+        "Your fleet is loaded. Run the analysis to discover idle, oversized and carbon-heavy resources.</div>",
+        unsafe_allow_html=True,
+    )
+    _, mid, _ = st.columns([2, 2, 2])
+    mid.button("🚀 Run analysis", type="primary", width="stretch", on_click=request_run, key="run_main")
+    k = st.columns(4)
+    with k[0]:
+        kpi("Resources", f"{len(fleet)}", "in scope", "k-slate")
+    with k[1]:
+        kpi("Current monthly cost", money(base_tot["cost_now"]), "baseline spend", "k-blue")
+    with k[2]:
+        kpi("Energy / month", kwh_fmt(base_tot["kwh_now"]), "incl. datacenter overhead", "k-amber")
+    with k[3]:
+        kpi("Carbon / month", co2_fmt(base_tot["co2_now"]), "CO₂e", "k-violet")
+    c1, c2 = st.columns(2)
+    by_env = base_df.groupby("env", as_index=False).cost_now.sum()
+    by_env["cost"] = by_env.cost_now * fx
+    c1.plotly_chart(
+        px.bar(by_env, x="env", y="cost", color="env", title=f"Monthly cost by environment ({sym})",
+               color_discrete_sequence=px.colors.qualitative.Safe).update_layout(showlegend=False),
+        width="stretch",
+    )
+    c2.plotly_chart(
+        px.histogram(fleet, x="cpu_avg", nbins=20, title="Average CPU utilization (%)",
+                     color_discrete_sequence=["#10b981"]),
+        width="stretch",
+    )
+    st.stop()
+
+# Defensive guard immediately before any dictionary access.
+# Launch with `streamlit run app.py` so st.stop() is handled by Streamlit.
+if not isinstance(A, dict):
+    st.error("Analysis results are not available yet. Click Run analysis to generate them.")
+    st.stop()
+
+required_analysis_keys = {"fleet", "cfg", "recs", "plan_ids", "run", "ts", "sig"}
+missing_analysis_keys = required_analysis_keys.difference(A)
+if missing_analysis_keys:
+    st.error(
+        "Analysis results are incomplete. Missing fields: "
+        + ", ".join(sorted(missing_analysis_keys))
+        + ". Please click Run analysis again."
+    )
+    st.stop()
+
+sel = set(ss.applied) if ss.applied is not None else current_selection()
+realized = ss.applied is not None
+afleet, acfg, recs = A["fleet"], A["cfg"], A["recs"]
+res, tot, by_fix = evaluate(afleet, acfg, sel)
+
+sav_cost = tot["cost_now"] - tot["cost_opt"]
+sav_kwh = tot["kwh_now"] - tot["kwh_opt"]
+sav_co2 = tot["co2_now"] - tot["co2_opt"]
+pct = lambda a, b: (a / b * 100) if b else 0.0  # noqa: E731
+
+if A["sig"] != settings_sig:
+    st.markdown(
+        '<div class="banner banner-info">⚠️ Settings or fleet changed since analysis #%d. '
+        "Click <b>Run analysis</b> to refresh the results.</div>" % A["run"],
+        unsafe_allow_html=True,
+    )
+if realized:
+    st.markdown(
+        f'<div class="banner banner-ok">✅ Fix plan applied - {len(sel)} fixes realized, saving '
+        f'<b>{money(sav_cost)}</b>/month and <b>{kwh_fmt(sav_kwh)}</b> of energy.</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f'<div class="banner banner-info">Analysis #{A["run"]} · {A["ts"]} · showing <b>projected</b> impact of '
+        f'{len(sel)} selected fixes. Apply the plan in the Fixer tab to make it real.</div>',
+        unsafe_allow_html=True,
+    )
+
+tab_over, tab_fix, tab_res, tab_method = st.tabs(["📊 Impact overview", "🛠️ Fixer recommendations", "🔍 Resources", "ℹ️ Method"])
+
+# ---------------------------- Overview --------------------------------------
+with tab_over:
+    label = "Realized" if realized else "Projected"
+    st.markdown(f"#### {label}: what we save vs. what we still spend")
+    c = st.columns(3)
+    with c[0]:
+        kpi("💰 Savings made", money(sav_cost), f"{money(sav_cost * 12)} per year · {pct(sav_cost, tot['cost_now']):.0f}% of spend", "k-green")
+    with c[1]:
+        kpi("📉 Cost minimised to", money(tot["cost_opt"]), f"down from {money(tot['cost_now'])} / month", "k-blue")
+    with c[2]:
+        kpi("⚡ Energy saved", kwh_fmt(sav_kwh), f"{pct(sav_kwh, tot['kwh_now']):.0f}% less · {co2_fmt(sav_co2)} CO₂e avoided", "k-amber")
+
+    st.write("")
+    b = st.columns(3)
+    specs = [
+        (f"Monthly cost ({sym})", tot["cost_now"] * fx, tot["cost_opt"] * fx, "#3b82f6"),
+        ("Energy (kWh / month)", tot["kwh_now"], tot["kwh_opt"], "#f59e0b"),
+        ("Carbon (kg CO₂e / month)", tot["co2_now"], tot["co2_opt"], "#8b5cf6"),
+    ]
+    for col, (title, a0, a1, color) in zip(b, specs):
+        fig = go.Figure(go.Bar(x=["Current", "Optimized"], y=[a0, a1], marker_color=["#94a3b8", color],
+                               text=[f"{a0:,.0f}", f"{a1:,.0f}"], textposition="outside"))
+        fig.update_layout(title=title, height=330, margin=dict(t=50, b=10, l=10, r=10), yaxis_range=[0, max(a0, 1) * 1.2])
+        col.plotly_chart(fig, width="stretch")
+
+    w1, w2 = st.columns([3, 2])
+    steps = [(FIXES[f]["label"], by_fix[f][0] * fx) for f in FIXES if by_fix[f][0] > 0.001]
+    wf = go.Figure(go.Waterfall(
+        orientation="v",
+        measure=["absolute"] + ["relative"] * len(steps) + ["total"],
+        x=["Current spend"] + [s[0] for s in steps] + ["Optimized spend"],
+        y=[tot["cost_now"] * fx] + [-s[1] for s in steps] + [tot["cost_opt"] * fx],
+        connector={"line": {"color": "#94a3b8"}},
+        decreasing={"marker": {"color": "#10b981"}},
+        totals={"marker": {"color": "#3b82f6"}},
+    ))
+    wf.update_layout(title=f"Cost waterfall ({sym} / month)", height=400, margin=dict(t=50, b=10))
+    w1.plotly_chart(wf, width="stretch")
+
+    if steps:
+        pie_df = pd.DataFrame(
+            [dict(fix=FIXES[f]["label"], energy=by_fix[f][1], cost=by_fix[f][0] * fx) for f in FIXES if by_fix[f][0] > 0.001]
+        )
+        pie = px.pie(pie_df, names="fix", values="cost", hole=0.55, title="Savings by fix type",
+                     color="fix", color_discrete_map={FIXES[f]["label"]: FIXES[f]["color"] for f in FIXES})
+        pie.update_layout(height=400, margin=dict(t=50, b=10))
+        w2.plotly_chart(pie, width="stretch")
+    else:
+        w2.info("No fixes selected - nothing to show yet. Pick fixes in the Fixer tab.")
+
+# ---------------------------- Fixer -----------------------------------------
+with tab_fix:
+    if recs.empty:
+        st.success("Nothing to fix - this fleet is already well optimized. 🎉")
+    else:
+        st.markdown("#### Top fixes by monthly savings")
+        top = recs.head(6)
+        for i in range(0, len(top), 3):
+            cols = st.columns(3)
+            for col, (_, r) in zip(cols, top.iloc[i:i + 3].iterrows()):
+                col.markdown(
+                    f"""<div class="rec" style="border-left-color:{FIXES[r.fix]['color']}">
+                    <div class="h">{r.action} · {r.resource}</div>
+                    <div class="d">{r.detail}</div>
+                    <div class="m">💰 <b>{money(r.cost)}</b>/mo &nbsp; ⚡ <b>{r.kwh:,.0f}</b> kWh &nbsp; 🌍 <b>{r.co2:,.0f}</b> kg</div>
+                    <div style="margin-top:10px"><span class="tag tag-{r.risk}">Risk: {r.risk}</span>
+                    <span class="tag tag-{r.effort}">Effort: {r.effort}</span>
+                    <span class="tag tag-{r.priority}">Priority: {r.priority}</span></div></div>""",
+                    unsafe_allow_html=True,
+                )
+            st.write("")
+
+        st.markdown("#### Fix plan")
+        st.caption("Tick the fixes you want. The Overview updates live. Estimates stack in order "
+                   "(rightsize → schedule → ARM → region); totals always recompute for your selection.")
+        bc = st.columns([1, 1, 2, 2])
+        bc[0].button("Select all", on_click=select_all, width="stretch")
+        bc[1].button("Clear", on_click=clear_all, width="stretch")
+        if realized:
+            bc[2].button("↩ Reopen plan", on_click=revert_plan, width="stretch")
+        else:
+            bc[2].button(f"✅ Apply {len(sel)} selected fixes", type="primary", on_click=apply_plan,
+                         width="stretch", disabled=len(sel) == 0)
+
+        table = pd.DataFrame(
             {
-                "Resource": item.get("resource_id", "—"),
-                "Current type": item.get("current_instance_type", "—"),
-                "Suggested type": item.get("suggested_instance_type") or "Review manually",
-                "Reason": item.get("reason", ""),
-                "Est. monthly savings (USD)": item.get("estimated_monthly_savings_usd"),
-                "Est. carbon reduction (kg CO₂e/month)": item.get(
-                    "estimated_monthly_carbon_reduction_kg"
-                ),
-                "Approval required": "Yes" if requires_approval else "Check policy",
-                "Approval status": item.get("approval_status", "Pending human review"),
+                "Apply": [i in ss.sel_base for i in recs["id"]],
+                "Priority": recs.priority,
+                "Resource": recs.resource,
+                "Env": recs.env,
+                "Fix": recs.action,
+                "What changes": recs.detail,
+                f"Saves {sym}/mo": (recs.cost * fx).round(0),
+                "Energy kWh": recs.kwh.round(0),
+                "CO₂ kg": recs.co2.round(0),
+                "Risk": recs.risk,
             }
         )
-    return rows
-
-
-def status_counts(checks: list[dict]) -> dict[str, int]:
-    counts = {"passed": 0, "failed": 0, "skipped": 0}
-    for check in checks:
-        status = check.get("status")
-        if status in counts:
-            counts[status] += 1
-    return counts
-
-
-def build_savings_comparison(recommendations: list[dict]) -> tuple[list[dict], list[str]]:
-    """Calculate transparent before/after scenarios from local synthetic assumptions.
-
-    This is a scenario model, not a live cloud bill or guaranteed savings forecast.
-    A recommendation with no target type is treated as a shutdown upper-bound only
-    when the Fixer supplied savings estimates (its non-production idle scenario).
-    """
-    import csv
-
-    pricing_path = DATA_DIR / "pricing.json"
-    regions_path = DATA_DIR / "regions.json"
-    metrics_path = DATA_DIR / "utilisation_backup.csv"
-    assumptions: list[str] = []
-
-    try:
-        with pricing_path.open("r", encoding="utf-8") as handle:
-            pricing = json.load(handle)
-        with regions_path.open("r", encoding="utf-8") as handle:
-            region_data = json.load(handle).get("regions", {})
-        with metrics_path.open("r", encoding="utf-8", newline="") as handle:
-            metrics = {row["resource_id"]: row for row in csv.DictReader(handle)}
-    except (OSError, ValueError, KeyError) as exc:
-        return [], [f"Could not load pricing, region or utilization assumptions: {exc}"]
-
-    instances = pricing.get("instances", {})
-    currency = pricing.get("currency", "USD")
-    rows: list[dict] = []
-    for rec in recommendations:
-        resource_id = rec.get("resource_id")
-        metric = metrics.get(resource_id)
-        current_type = rec.get("current_instance_type")
-        target_type = rec.get("suggested_instance_type")
-        if not metric:
-            assumptions.append(f"{resource_id}: no utilization row; comparison omitted.")
-            continue
-
-        try:
-            hours = float(metric["monthly_hours"])
-        except (TypeError, ValueError, KeyError):
-            assumptions.append(f"{resource_id}: invalid monthly_hours; comparison omitted.")
-            continue
-
-        current_spec = instances.get(current_type)
-        if not isinstance(current_spec, dict):
-            assumptions.append(f"{resource_id}: current type {current_type!r} is not priced; comparison omitted.")
-            continue
-
-        region = metric.get("region", "")
-        region_entry = region_data.get(region, {})
-        intensity_grams = region_entry.get("carbon_gco2_per_kwh") if isinstance(region_entry, dict) else None
-        if isinstance(intensity_grams, (int, float)) and not isinstance(intensity_grams, bool) and intensity_grams >= 0:
-            intensity_kg = float(intensity_grams) / 1000.0
-            intensity_source = f"regions.json synthetic factor ({intensity_grams:g} gCO₂e/kWh)"
-        else:
-            intensity_kg = 0.4
-            intensity_source = "fallback assumption (0.4 kg CO₂e/kWh; region missing)"
-
-        before_cost = float(current_spec["hourly_usd"]) * hours
-        before_energy = float(current_spec["avg_watts"]) * hours / 1000.0
-        before_carbon = before_energy * intensity_kg
-
-        if target_type:
-            target_spec = instances.get(target_type)
-            if not isinstance(target_spec, dict):
-                assumptions.append(f"{resource_id}: target type {target_type!r} is not priced; comparison omitted.")
-                continue
-            after_cost = float(target_spec["hourly_usd"]) * hours
-            after_energy = float(target_spec["avg_watts"]) * hours / 1000.0
-            after_carbon = after_energy * intensity_kg
-            scenario = f"Right-size {current_type} → {target_type}"
-            scenario_assumption = "Assumes the workload runs the same monthly hours on the suggested type."
-        elif rec.get("estimated_monthly_savings_usd") is not None:
-            # Only show this as a shutdown upper-bound if the Fixer itself supplied
-            # a savings estimate. Do not infer shutdown for production review-only recs.
-            after_cost = 0.0
-            after_energy = 0.0
-            after_carbon = 0.0
-            scenario = "Full shutdown upper-bound scenario"
-            scenario_assumption = "Assumes the resource is off for all recorded hours; not an automatic action or guaranteed saving."
-        else:
-            assumptions.append(f"{resource_id}: review-only recommendation has no modeled after-state; no savings claimed.")
-            continue
-
-        monthly_savings = before_cost - after_cost
-        monthly_carbon_reduction = before_carbon - after_carbon
-        savings_pct = (monthly_savings / before_cost * 100.0) if before_cost > 0 else None
-        rows.append({
-            "Resource": resource_id,
-            "Scenario": scenario,
-            "Current type": current_type,
-            "Proposed type": target_type or "Shutdown upper-bound (review only)",
-            "Current monthly cost (USD)": round(before_cost, 2),
-            "Scenario monthly cost (USD)": round(after_cost, 2),
-            "Potential monthly savings (USD)": round(monthly_savings, 2),
-            "Potential annualized gross savings (USD)": round(monthly_savings * 12, 2),
-            "Cost reduction (%)": round(savings_pct, 1) if savings_pct is not None else None,
-            "Current energy (kWh/month)": round(before_energy, 3),
-            "Scenario energy (kWh/month)": round(after_energy, 3),
-            "Potential carbon reduction (kg CO₂e/month)": round(monthly_carbon_reduction, 3),
-            "Carbon factor source": intensity_source,
-            "Assumption": scenario_assumption,
-            "Currency": currency,
-        })
-
-    return rows, assumptions
-
-
-
-def build_memory_comparison(
-    recommendations: list[dict], findings: list[dict]
-) -> tuple[list[dict], list[str]]:
-    """Build a transparent memory scenario from explicit recs or safe candidates.
-
-    If the Fixer did not emit a target instance, an illustrative candidate is
-    generated only for underused findings, using synthetic specs and conservative
-    average-memory/peak-CPU headroom checks. This is not an applied change.
-    """
-    import csv
-
-    pricing_path = DATA_DIR / "pricing.json"
-    metrics_path = DATA_DIR / "utilisation_backup.csv"
-    notes: list[str] = []
-    try:
-        with pricing_path.open("r", encoding="utf-8") as handle:
-            pricing = json.load(handle)
-        with metrics_path.open("r", encoding="utf-8", newline="") as handle:
-            metrics = {str(row.get("resource_id", "")).strip(): row for row in csv.DictReader(handle)}
-    except (OSError, ValueError, KeyError) as exc:
-        return [], [f"Could not load memory assumptions: {exc}"]
-
-    instances = pricing.get("instances", {})
-    if not isinstance(instances, dict) or not instances:
-        return [], ["data/pricing.json has no usable 'instances' dictionary."]
-
-    # Normalize the incoming report so field-name differences do not silently
-    # hide usable recommendations. Findings provide the observed utilization.
-    rec_by_id: dict[str, dict] = {}
-    for rec in recommendations:
-        rid = str(rec.get("resource_id") or "").strip()
-        if rid:
-            rec_by_id[rid] = rec
-
-    finding_by_id: dict[str, dict] = {}
-    for finding in findings:
-        rid = str(finding.get("resource_id") or "").strip()
-        if rid:
-            finding_by_id[rid] = finding
-
-    resource_ids = list(dict.fromkeys(list(rec_by_id) + list(finding_by_id)))
-    rows: list[dict] = []
-    for rid in resource_ids:
-        rec = rec_by_id.get(rid, {})
-        finding = finding_by_id.get(rid, {})
-        evidence = finding.get("evidence") if isinstance(finding.get("evidence"), dict) else {}
-        metric = metrics.get(rid, {})
-
-        current_type = (rec.get("current_instance_type") or rec.get("instance_type")
-                        or evidence.get("instance_type") or metric.get("instance_type"))
-        target_type = (rec.get("suggested_instance_type") or rec.get("target_instance_type")
-                       or rec.get("recommended_instance_type") or rec.get("suggested_type"))
-        current_spec = instances.get(current_type, {}) if current_type else {}
-        if not isinstance(current_spec, dict) or number(current_spec.get("memory_gib")) is None:
-            notes.append(f"{rid}: current instance type {current_type!r} is missing from pricing.json.")
-            continue
-
-        mem_pct = number(evidence.get("avg_mem_pct"))
-        if mem_pct is None:
-            mem_pct = number(metric.get("avg_mem_pct"))
-        cpu_peak = number(evidence.get("max_cpu_pct"))
-        if cpu_peak is None:
-            cpu_peak = number(metric.get("max_cpu_pct"))
-        if mem_pct is None or not 0 <= mem_pct <= 100:
-            notes.append(f"{rid}: average memory utilization is missing or invalid; excluded.")
-            continue
-
-        # Only infer a candidate when the analyzer explicitly marks the resource
-        # underused. Idle resources need a separate shutdown/scheduling review.
-        finding_type = str(finding.get("finding_type") or finding.get("status") or "").lower()
-        if not target_type and finding_type in {
-            "underused", "underutilized", "underutilised", "over_provisioned",
-            "overprovisioned", "right_size", "rightsize"
-        }:
-            current_mem = float(current_spec["memory_gib"])
-            estimated_used = current_mem * mem_pct / 100.0
-            current_vcpu = number(current_spec.get("vcpu")) or 0
-            candidates = []
-            for candidate, spec in instances.items():
-                if not isinstance(spec, dict) or candidate == current_type:
-                    continue
-                candidate_mem = number(spec.get("memory_gib"))
-                candidate_vcpu = number(spec.get("vcpu"))
-                if candidate_mem is None or candidate_vcpu is None:
-                    continue
-                # Keep average memory <=75% and projected peak CPU <=80%.
-                projected_mem_pct = (estimated_used / candidate_mem * 100.0) if candidate_mem else 999
-                projected_cpu = (cpu_peak * current_vcpu / candidate_vcpu) if cpu_peak is not None and candidate_vcpu else None
-                if candidate_mem < current_mem and projected_mem_pct <= 75 and (projected_cpu is None or projected_cpu <= 80):
-                    candidates.append((candidate_mem, candidate))
-            if candidates:
-                target_type = min(candidates)[1]
-                notes.append(f"{rid}: proposed type {target_type} is an illustrative candidate inferred from the underused signal; verify peak/headroom before acting.")
-
-        if not target_type:
-            notes.append(f"{rid}: no right-sizing target was emitted and no safe underused candidate could be inferred.")
-            continue
-
-        target_spec = instances.get(target_type, {})
-        if not isinstance(target_spec, dict) or number(target_spec.get("memory_gib")) is None:
-            notes.append(f"{rid}: proposed type {target_type!r} is missing from pricing.json.")
-            continue
-
-        current_mem = float(current_spec["memory_gib"])
-        target_mem = float(target_spec["memory_gib"])
-        estimated_used = current_mem * mem_pct / 100.0
-        before_unused = max(current_mem - estimated_used, 0.0)
-        after_unused = max(target_mem - estimated_used, 0.0)
-        target_risk = estimated_used > target_mem
-        rows.append({
-            "Resource": rid,
-            "Current instance": current_type,
-            "Proposed instance": target_type,
-            "Average memory utilization (%)": round(mem_pct, 1),
-            "Current allocated memory (GiB)": round(current_mem, 2),
-            "Estimated workload memory used (GiB)": round(estimated_used, 2),
-            "Proposed allocated memory (GiB)": round(target_mem, 2),
-            "Capacity released (GiB)": round(current_mem - target_mem, 2),
-            "Estimated unused before (GiB)": round(before_unused, 2),
-            "Estimated unused after (GiB)": round(after_unused, 2),
-            "Unused capacity reduction (%)": round((before_unused - after_unused) / before_unused * 100, 1) if before_unused > 0 else None,
-            "Capacity check": "REVIEW: proposed memory below estimated current use" if target_risk else "Average-use check passed; peak headroom still needs validation",
-            "Scenario type": "Existing recommendation" if (rec.get("suggested_instance_type") or rec.get("target_instance_type") or rec.get("recommended_instance_type") or rec.get("suggested_type")) else "Illustrative candidate — not an approved recommendation",
-        })
-
-    return rows, notes
-
-def run_pipeline() -> None:
-    try:
-        with st.spinner("Analyzing synthetic resource data…"):
-            report = run_sample_pipeline()
-            st.session_state["greenops_report"] = report_to_dict(report)
-            st.session_state["greenops_last_run"] = datetime.now().astimezone().strftime(
-                "%Y-%m-%d %H:%M:%S %Z"
-            )
-            st.session_state.pop("greenops_run_error", None)
-    except Exception as exc:
-        st.session_state["greenops_run_error"] = f"{type(exc).__name__}: {exc}"
-
-
-# Sidebar: clear scope and a single, explicit way to rerun the analysis.
-with st.sidebar:
-    st.markdown("## 🌱 GreenOps")
-    st.caption("Cloud cost & sustainability intelligence")
-    st.divider()
-    st.markdown("**Analysis controls**")
-    if st.button("↻ Run analysis", type="primary", use_container_width=True):
-        run_pipeline()
-    if "greenops_last_run" in st.session_state:
-        st.caption(f"Last run: {st.session_state['greenops_last_run']}")
-    st.divider()
-    st.markdown("**Prototype scope**")
-    st.caption("Local CSV + synthetic pricing and carbon assumptions.")
-    st.caption("No cloud account is connected.")
-    st.caption("No Terraform changes are applied.")
-    st.caption("Recommendations are not approvals.")
-
-
-st.markdown('<div class="greenops-eyebrow">Cloud sustainability workspace</div>', unsafe_allow_html=True)
-st.title("GreenOps dashboard")
-st.markdown(
-    '<div class="greenops-subtitle">Find waste signals, understand estimated impact, '
-    'and review recommendations before any infrastructure change.</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    '<div class="greenops-note"><strong>Safety by design:</strong> this dashboard uses '
-    'synthetic sample data. All cost, energy, and carbon figures are estimates. '
-    'No changes are deployed automatically.</div>',
-    unsafe_allow_html=True,
-)
-
-if "greenops_report" not in st.session_state and "greenops_run_error" not in st.session_state:
-    run_pipeline()
-
-if st.session_state.get("greenops_run_error"):
-    st.error("The analysis could not complete.")
-    st.code(st.session_state["greenops_run_error"])
-    st.info("Check the terminal traceback and verify the sample data files are present.")
-    st.stop()
-
-report = st.session_state.get("greenops_report")
-if not isinstance(report, dict):
-    st.info("Click **Run analysis** in the sidebar to generate the first report.")
-    st.stop()
-
-findings = as_records(report.get("findings"))
-estimates = as_records(report.get("estimates"))
-recommendations = as_records(report.get("recommendations"))
-checks = as_records(report.get("validation_checks"))
-errors = as_records(report.get("errors"))
-notes = report.get("notes") if isinstance(report.get("notes"), list) else []
-
-finding_rows = flatten_findings(findings)
-estimate_rows = flatten_estimates(estimates)
-recommendation_rows = flatten_recommendations(recommendations)
-
-cost_total = total(estimates, "monthly_cost_usd")
-energy_total = total(estimates, "monthly_energy_kwh")
-carbon_total = total(estimates, "monthly_carbon_kg")
-potential_savings = total(recommendations, "estimated_monthly_savings_usd")
-potential_carbon_reduction = total(
-    recommendations, "estimated_monthly_carbon_reduction_kg"
-)
-
-review_count = sum(
-    str(item.get("finding_type", "")).lower() in {"idle", "underused", "review"}
-    for item in findings
-)
-approval_count = sum(
-    bool(item.get("requires_human_approval", True)) for item in recommendations
-)
-counts = status_counts(checks)
-
-# Top-level summary.
-st.subheader("Executive overview")
-metric_cols = st.columns(5)
-metric_cols[0].metric("Resources analyzed", f"{len(findings):,}")
-metric_cols[1].metric("Signals to review", f"{review_count:,}")
-metric_cols[2].metric("Est. monthly cost", money(cost_total))
-metric_cols[3].metric("Est. monthly carbon", f"{carbon_total:,.2f} kg")
-metric_cols[4].metric("Recommendations", f"{len(recommendations):,}")
-
-st.caption(
-    f"Estimates cover {len(estimates)} resource record(s). "
-    f"Potential savings shown below are illustrative scenarios, not guaranteed outcomes."
-)
-
-overview_tab, findings_tab, impact_tab, roi_tab, memory_tab, recommendations_tab, validation_tab = st.tabs(
-    [
-        "Overview",
-        "Resource findings",
-        "Cost & carbon",
-        "Savings & ROI",
-        "Before vs After Memory",
-        "Recommendations & approval",
-        "Validation & errors",
-    ]
-)
-
-with overview_tab:
-    left, right = st.columns([1.1, 1])
-    with left:
-        st.markdown("### What needs attention?")
-        if finding_rows:
-            summary_df = pd.DataFrame(finding_rows)
-            summary = (
-                summary_df.groupby("Finding", dropna=False)
-                .size()
-                .reset_index(name="Resources")
-                .sort_values("Resources", ascending=False)
-            )
-            st.bar_chart(summary.set_index("Finding"), height=260)
-        else:
-            st.info("No findings were returned by the Analyzer.")
-    with right:
-        st.markdown("### Validation health")
-        health_cols = st.columns(3)
-        health_cols[0].metric("Passed", counts["passed"])
-        health_cols[1].metric("Failed", counts["failed"])
-        health_cols[2].metric("Skipped", counts["skipped"])
-        if counts["failed"]:
-            st.warning(
-                f"{counts['failed']} validation check(s) failed. Review the Validation & errors tab."
-            )
-        elif counts["skipped"]:
-            st.info(
-                f"{counts['skipped']} check(s) were skipped. Review their reasons before acting."
-            )
-        else:
-            st.success("No failed or skipped validation checks were reported.")
-
-    st.markdown("### Largest estimated resource costs")
-    if estimate_rows:
-        cost_df = pd.DataFrame(estimate_rows)
-        cost_df["Monthly cost (USD)"] = pd.to_numeric(
-            cost_df["Monthly cost (USD)"], errors="coerce"
+        st.data_editor(
+            table, hide_index=True, width="stretch", height=420,
+            key=f"editor_{A['run']}_{ss.editor_ver}",
+            disabled=[c for c in table.columns if c != "Apply"],
+            column_config={"Apply": st.column_config.CheckboxColumn("Apply", default=False)},
         )
-        cost_df = cost_df.dropna(subset=["Monthly cost (USD)"]).sort_values(
-            "Monthly cost (USD)", ascending=False
-        ).head(8)
-        if not cost_df.empty:
-            st.bar_chart(
-                cost_df.set_index("Resource")[["Monthly cost (USD)"]],
-                height=280,
-            )
-        else:
-            st.info("Cost values are unavailable for charting.")
-    else:
-        st.info("No cost estimates are available.")
+        export = recs[["resource", "env", "action", "detail", "cost", "kwh", "co2", "risk", "effort", "priority"]]
+        st.download_button("⬇ Export recommendations (CSV)", export.to_csv(index=False), "greenops_recommendations.csv", "text/csv")
 
-with findings_tab:
-    st.markdown("### Resource utilization findings")
-    if not finding_rows:
-        st.info("No resource findings are available.")
-    else:
-        findings_df = pd.DataFrame(finding_rows)
-        filter_cols = st.columns(2)
-        finding_types = sorted(findings_df["Finding"].dropna().astype(str).unique())
-        severities = sorted(findings_df["Severity"].dropna().astype(str).unique())
-        selected_types = filter_cols[0].multiselect(
-            "Filter by finding", finding_types, default=finding_types
-        )
-        selected_severities = filter_cols[1].multiselect(
-            "Filter by severity", severities, default=severities
-        )
-        filtered = findings_df[
-            findings_df["Finding"].astype(str).isin(selected_types)
-            & findings_df["Severity"].astype(str).isin(selected_severities)
-        ]
-        st.dataframe(filtered, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download findings CSV",
-            data=filtered.to_csv(index=False).encode("utf-8"),
-            file_name="greenops_findings.csv",
-            mime="text/csv",
-        )
-
-with impact_tab:
-    st.markdown("### Estimated cost, energy and carbon")
-    impact_cols = st.columns(3)
-    impact_cols[0].metric("Monthly cost estimate", money(cost_total))
-    impact_cols[1].metric("Monthly energy estimate", f"{energy_total:,.2f} kWh")
-    impact_cols[2].metric("Monthly carbon estimate", f"{carbon_total:,.2f} kg CO₂e")
-
-    st.caption(
-        "Values use local synthetic pricing, power assumptions and regional carbon factors. "
-        "They are not live cloud billing or verified emissions measurements."
+# ---------------------------- Resources -------------------------------------
+with tab_res:
+    f1, f2 = st.columns([3, 1])
+    envs = f1.multiselect("Environment", sorted(res.env.unique()), default=sorted(res.env.unique()))
+    only = f2.toggle("Only changed", value=False)
+    view = res[res.env.isin(envs)].copy()
+    if only:
+        view = view[view.fixes != "—"]
+    view["saving"] = (view.cost_now - view.cost_opt) * fx
+    show = view[["name", "env", "status", "region", "instance_size", "arch", "cpu_avg", "cost_now", "cost_opt",
+                 "saving", "kwh_now", "kwh_opt", "co2_now", "co2_opt", "fixes"]].copy()
+    for col in ("cost_now", "cost_opt"):
+        show[col] = show[col] * fx
+    st.dataframe(
+        show.rename(columns={"cost_now": f"cost now ({sym})", "cost_opt": f"cost after ({sym})", "saving": f"saved ({sym})"}),
+        hide_index=True, width="stretch", height=430,
+        column_config={"cpu_avg": st.column_config.ProgressColumn("avg CPU %", min_value=0, max_value=100, format="%.0f")},
     )
+    sc = px.scatter(view, x="cpu_avg", y=view.cost_now * fx, color="status", size="cost_now", hover_name="name",
+                    title="Utilization vs. cost - idle & oversized resources stand out",
+                    labels={"cpu_avg": "avg CPU %", "y": f"monthly cost ({sym})"},
+                    color_discrete_map={"Idle": "#ef4444", "Optimizable": "#f59e0b", "Healthy": "#10b981"})
+    st.plotly_chart(sc, width="stretch")
 
-    if estimate_rows:
-        estimates_df = pd.DataFrame(estimate_rows)
-        st.dataframe(estimates_df, use_container_width=True, hide_index=True)
-        if "Monthly cost (USD)" in estimates_df:
-            chart_df = estimates_df.copy()
-            chart_df["Monthly cost (USD)"] = pd.to_numeric(
-                chart_df["Monthly cost (USD)"], errors="coerce"
-            )
-            chart_df = chart_df.dropna(subset=["Monthly cost (USD)"]).sort_values(
-                "Monthly cost (USD)", ascending=False
-            ).head(10)
-            if not chart_df.empty:
-                st.markdown("#### Cost by resource")
-                st.bar_chart(
-                    chart_df.set_index("Resource")[["Monthly cost (USD)"]],
-                    height=280,
-                )
-    else:
-        st.info("No cost/carbon estimates were returned.")
+# ---------------------------- Method ----------------------------------------
+with tab_method:
+    st.markdown(
+        f"""
+**How the numbers are modelled** (edit the constants at the top of `app.py` to match your cloud):
 
-    if recommendation_rows:
-        st.markdown("### Illustrative recommendation impact")
-        savings_cols = st.columns(2)
-        savings_cols[0].metric("Potential monthly savings", money(potential_savings))
-        savings_cols[1].metric(
-            "Potential monthly carbon reduction",
-            f"{potential_carbon_reduction:,.2f} kg CO₂e",
-        )
-        st.caption(
-            "These figures are sums of recommendation estimates where available. "
-            "They may be incomplete and are not guaranteed savings."
-        )
+- **Cost** = vCPUs × ${PRICE_PER_VCPU_HR}/vCPU-hr × running hours × regional price factor (ARM is {int((1 - ARM_PRICE_FACTOR) * 100)}% cheaper).
+- **Energy** = vCPUs × (2.5 W idle + 6.5 W × utilization) × hours × PUE {PUE} (ARM draws {int((1 - ARM_POWER_FACTOR) * 100)}% less).
+- **Carbon** = energy × regional grid intensity (kg CO₂e per kWh).
 
-with roi_tab:
-    st.markdown("### Before-and-after savings scenarios")
-    st.caption(
-        "Scenario estimates use local synthetic pricing and recorded monthly hours. "
-        "They are not live cloud prices, guaranteed savings, or approval to make a change."
+**Fixes**
+
+| Fix | Rule |
+|---|---|
+| 🗑️ Terminate idle | avg CPU < {acfg['idle_thr']:.0f}% and peak < {acfg['idle_thr'] * 3:.0f}% |
+| 📐 Rightsize | smallest size keeping peak load ≤ {acfg['headroom']:.0f}% |
+| ⏰ Off-hours schedule | dev/test/staging running 24/7 → {acfg['sched_hours']:.0f} h/week |
+| 🧬 Move to ARM | x86 workloads |
+| 🌍 Greener region | grid ≥ 0.25 kg/kWh and ≥ 2× the target ({acfg['green_region']}) |
+
+Upload your own fleet as CSV with columns: `name, env, region, instance_size, cpu_avg, cpu_peak` (optional: `arch, hours`).
+"""
     )
-    comparison_rows, comparison_notes = build_savings_comparison(recommendations)
-
-    if not comparison_rows:
-        st.info("No recommendations have a calculable before/after scenario yet. Review-only recommendations are intentionally not assigned fictional savings.")
-    else:
-        comparison_df = pd.DataFrame(comparison_rows)
-        monthly_before = float(comparison_df["Current monthly cost (USD)"].sum())
-        monthly_after = float(comparison_df["Scenario monthly cost (USD)"].sum())
-        monthly_savings = monthly_before - monthly_after
-        annualized_savings = monthly_savings * 12
-        monthly_carbon_reduction = float(comparison_df["Potential carbon reduction (kg CO₂e/month)"].sum())
-        cost_reduction_pct = (monthly_savings / monthly_before * 100.0) if monthly_before > 0 else None
-
-        roi_cols = st.columns(4)
-        roi_cols[0].metric("Current monthly cost", money(monthly_before))
-        roi_cols[1].metric("Scenario monthly cost", money(monthly_after))
-        roi_cols[2].metric("Potential monthly savings", money(monthly_savings), delta=f"{cost_reduction_pct:.1f}% cost reduction" if cost_reduction_pct is not None else None)
-        roi_cols[3].metric("Annualized gross savings", money(annualized_savings))
-        st.metric("Potential monthly carbon reduction", f"{monthly_carbon_reduction:,.3f} kg CO₂e")
-
-        st.markdown("#### Compare each proposed scenario")
-        chart_df = comparison_df.set_index("Resource")[["Current monthly cost (USD)", "Scenario monthly cost (USD)"]]
-        st.bar_chart(chart_df, height=300)
-        st.dataframe(comparison_df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download before/after comparison CSV",
-            data=comparison_df.to_csv(index=False).encode("utf-8"),
-            file_name="greenops_before_after_comparison.csv",
-            mime="text/csv",
-        )
-
-        st.markdown("#### Optional first-year ROI scenario")
-        implementation_cost = st.number_input(
-            "Estimated one-time implementation cost (USD)",
-            min_value=0.0,
-            value=0.0,
-            step=100.0,
-            help="Enter your own estimated labor/migration/testing cost. This is an assumption, not a value GreenOps can infer.",
-        )
-        if implementation_cost > 0:
-            first_year_net_benefit = annualized_savings - implementation_cost
-            first_year_roi = first_year_net_benefit / implementation_cost * 100.0
-            roi_cols = st.columns(2)
-            roi_cols[0].metric("First-year net benefit estimate", money(first_year_net_benefit))
-            roi_cols[1].metric("First-year ROI estimate", f"{first_year_roi:,.1f}%")
-            if monthly_savings > 0:
-                st.caption(f"Simple payback estimate: {implementation_cost / monthly_savings:,.1f} month(s), assuming the monthly savings scenario is realized consistently.")
-            else:
-                st.caption("Payback is not meaningful because this scenario does not produce positive monthly savings.")
-        else:
-            st.info("Enter a one-time implementation cost above to calculate an illustrative first-year ROI. Until then, GreenOps reports gross savings potential only—not an ROI percentage.")
-
-    with st.expander("How the savings and ROI estimates are calculated"):
-        st.markdown(
-            """
-            - **Current monthly cost** = synthetic hourly price × `monthly_hours` from `data/utilisation_backup.csv`.
-            - **Right-sized scenario cost** = target synthetic hourly price × the same recorded monthly hours.
-            - **Energy estimate** = synthetic average watts × monthly hours ÷ 1,000.
-            - **Carbon estimate** = estimated kWh × regional synthetic carbon intensity from `data/regions.json`. If the region is absent, a clearly labelled 0.4 kg CO₂e/kWh fallback is used.
-            - **Potential monthly savings** = current estimated cost − scenario estimated cost. A negative value means the scenario costs more under these assumptions.
-            - **Annualized gross savings** = potential monthly savings × 12. This assumes the same scenario and usage persist for a full year.
-            - **First-year ROI** = (annualized gross savings − user-entered one-time implementation cost) ÷ implementation cost × 100. It excludes ongoing operating costs, taxes, price changes, workload changes, and migration risk.
-            - **Shutdown upper bound** is shown only when the Fixer supplied a savings estimate for that idle resource. It assumes zero usage/cost for all recorded hours and is not a recommendation to stop a resource automatically.
-            - **No actual deployment occurs.** All recommendations still require human approval; these are synthetic development estimates, not verified cloud quotes or emissions measurements.
-            """
-        )
-
-    if comparison_notes:
-        with st.expander("Items excluded from the comparison"):
-            for note in comparison_notes:
-                st.write(f"- {note}")
-
-
-
-with memory_tab:
-    st.markdown("### Before vs after: memory capacity and estimated waste")
-    st.caption(
-        "This comparison uses average memory utilization from the sample utilization data "
-        "and memory capacity from synthetic instance specifications. It estimates unused "
-        "allocated capacity; it is not a direct measurement of physical RAM or a production guarantee."
-    )
-    memory_rows, memory_notes = build_memory_comparison(recommendations, findings)
-    if not memory_rows:
-        st.info(
-            "No valid before/after memory scenario could be calculated. GreenOps only infers an "
-            "illustrative smaller instance for findings explicitly marked underused and only when "
-            "the synthetic memory and CPU headroom checks pass."
-        )
-        if memory_notes:
-            with st.expander("Why resources were excluded"):
-                for note in memory_notes:
-                    st.write(f"- {note}")
-    else:
-        memory_df = pd.DataFrame(memory_rows)
-        total_before_mem = float(memory_df["Current allocated memory (GiB)"].sum())
-        total_after_mem = float(memory_df["Proposed allocated memory (GiB)"].sum())
-        total_before_unused = float(memory_df["Estimated unused before (GiB)"].sum())
-        total_after_unused = float(memory_df["Estimated unused after (GiB)"].sum())
-        total_capacity_released = total_before_mem - total_after_mem
-        unused_reduction_pct = (
-            (total_before_unused - total_after_unused) / total_before_unused * 100.0
-            if total_before_unused > 0 else None
-        )
-        mem_cols = st.columns(4)
-        mem_cols[0].metric("Allocated memory before", f"{total_before_mem:,.2f} GiB")
-        mem_cols[1].metric("Allocated memory after", f"{total_after_mem:,.2f} GiB")
-        mem_cols[2].metric("Capacity released", f"{total_capacity_released:,.2f} GiB")
-        mem_cols[3].metric(
-            "Estimated unused-capacity reduction",
-            f"{unused_reduction_pct:,.1f}%" if unused_reduction_pct is not None else "—",
-        )
-
-        st.markdown("#### The visible difference")
-        chart_cols = st.columns(2)
-        with chart_cols[0]:
-            st.markdown("**Allocated memory by resource (GiB)**")
-            allocated_chart = memory_df.set_index("Resource")[
-                ["Current allocated memory (GiB)", "Proposed allocated memory (GiB)"]
-            ]
-            st.bar_chart(allocated_chart, height=300)
-        with chart_cols[1]:
-            st.markdown("**Estimated unused capacity (GiB)**")
-            unused_chart = memory_df.set_index("Resource")[
-                ["Estimated unused before (GiB)", "Estimated unused after (GiB)"]
-            ]
-            st.bar_chart(unused_chart, height=300)
-
-        st.markdown("#### Resource-level evidence and proposed change")
-        st.dataframe(memory_df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download memory before/after CSV",
-            data=memory_df.to_csv(index=False).encode("utf-8"),
-            file_name="greenops_memory_before_after.csv",
-            mime="text/csv",
-        )
-        unsafe = memory_df[memory_df["Capacity check"].str.startswith("REVIEW:")]
-        if not unsafe.empty:
-            st.warning(
-                f"{len(unsafe)} proposed change(s) have less memory than the estimated average "
-                "workload use. Do not present these as safe savings; review/reject or resize the target."
-            )
-
-    with st.expander("How memory waste is estimated"):
-        st.markdown(
-            """
-            - **Estimated workload memory used** = current instance memory capacity × recorded average memory utilization (%).
-            - **Estimated unused capacity before** = current capacity − estimated workload memory used.
-            - **Estimated unused capacity after** = max(proposed capacity − estimated workload memory used, 0).
-            - **Capacity released** = current allocated capacity − proposed allocated capacity. A negative number means the proposed type allocates more memory.
-            - This is a simplified average-utilization estimate. Peak usage, safety headroom, workload changes, cache behavior, and real cloud telemetry are not modeled. A proposed target below estimated current use is flagged for review.
-            - All values rely on synthetic instance specifications and sample data; they are not measured production savings.
-            """
-        )
-    if memory_notes:
-        with st.expander("Memory comparison notes"):
-            for note in memory_notes:
-                st.write(f"- {note}")
-
-
-with recommendations_tab:
-    st.markdown("### Proposed optimizations")
-    st.caption(
-        "Recommendations are suggestions only. Review the rationale and data alignment "
-        "before approving any future configuration change."
-    )
-    if recommendation_rows:
-        rec_df = pd.DataFrame(recommendation_rows)
-        st.dataframe(rec_df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download recommendations CSV",
-            data=rec_df.to_csv(index=False).encode("utf-8"),
-            file_name="greenops_recommendations.csv",
-            mime="text/csv",
-        )
-        st.info(
-            f"{approval_count} recommendation(s) require human approval. "
-            "Approval/rejection actions are intentionally not simulated here; "
-            "connect the Stage 5 approval workflow when your teammate's implementation is ready."
-        )
-    else:
-        st.success("No optimization recommendations were generated for this run.")
-        st.caption("This may mean no eligible findings were found, or safety checks blocked changes.")
-
-with validation_tab:
-    st.markdown("### Data and safety validation")
-    if checks:
-        check_df = pd.DataFrame(
-            [
-                {
-                    "Check": item.get("name", "—"),
-                    "Status": item.get("status", "—"),
-                    "Details": item.get("message", ""),
-                }
-                for item in checks
-            ]
-        )
-        st.dataframe(check_df, use_container_width=True, hide_index=True)
-
-        alignment = [
-            item for item in checks if item.get("name") == "terraform_data_alignment"
-        ]
-        if alignment and any(item.get("status") == "failed" for item in alignment):
-            st.warning(
-                "CSV and Terraform data do not fully align. Do not approve affected "
-                "recommendations until the mismatches have been reviewed."
-            )
-    else:
-        st.info("No validation checks were returned.")
-
-    if errors:
-        st.markdown("### Agent errors")
-        st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
-    else:
-        st.success("No runtime agent errors were reported.")
-
-    if notes:
-        st.markdown("### Run notes")
-        for note in notes:
-            st.write(f"- {note}")
-
-# A reproducible artifact for debugging, judging, or future integration.
-st.divider()
-with st.expander("View raw report JSON"):
-    st.json(report)
-
-st.download_button(
-    "Download full report JSON",
-    data=json.dumps(report, indent=2, ensure_ascii=False, default=str),
-    file_name="greenops_report.json",
-    mime="application/json",
-)
