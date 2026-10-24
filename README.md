@@ -1,90 +1,73 @@
 # GreenOps Agent
 
-GreenOps Agent is a work-in-progress sustainability tool designed to identify cloud infrastructure waste, estimate potential cost savings and carbon emissions, and recommend safer, more efficient resource configurations.
+An AI-assisted cloud optimization solution designed to identify underutilized infrastructure, estimate cloud costs and carbon emissions, and recommend safer, more sustainable resource configurations.
 
-The project explores how AI-driven agents can help organizations improve cloud resource utilization, reduce unnecessary infrastructure expenditure, and make more environmentally responsible computing decisions.
+## Overview
 
-> **Project Status:** Early development. The application uses synthetic sample data, and the agents are currently placeholders. No real cloud accounts are accessed, and no infrastructure changes are applied automatically.
+Cloud infrastructure can become expensive and energy-intensive when resources are underutilized or oversized. Identifying optimization opportunities manually can be time-consuming and may lead to unnecessary cloud spending and carbon emissions.
 
-## Problem Statement
-
-Cloud infrastructure can waste money and energy when resources are over-provisioned, underutilized, or left running unnecessarily. Identifying these inefficiencies manually can be time-consuming, and reducing costs without compromising system reliability requires careful analysis.
-
-GreenOps Agent aims to address this problem by analyzing infrastructure utilization, estimating its environmental impact, and suggesting potential optimization strategies.
-
-## Proposed Solution
-
-The project uses a modular, agent-based architecture to analyze cloud resource usage and generate optimization recommendations.
-
-The proposed workflow includes:
-
-1. Analyze infrastructure utilization data.
-2. Identify idle or underutilized resources.
-3. Estimate energy consumption and carbon dioxide equivalent emissions (CO2e).
-4. Evaluate potential cost savings and right-sizing opportunities.
-5. Generate proposed configuration changes.
-6. Validate recommendations and require human approval before any future implementation.
-
-Currently, these capabilities are being developed and tested using synthetic data.
+GreenOps Agent analyzes infrastructure utilization data, estimates potential cost and carbon impacts, and generates optimization recommendations. It incorporates a human approval workflow to help prevent unauthorized infrastructure changes.
 
 ## Key Features
 
-- **Resource Utilization Analysis:** Identify potentially idle or underutilized infrastructure.
-- **Carbon Impact Estimation:** Estimate energy consumption and associated CO2e emissions.
-- **Cost Optimization:** Analyze synthetic pricing data to estimate potential savings.
-- **Right-Sizing Recommendations:** Suggest more appropriate resource configurations.
-- **Configuration Validation:** Provide a foundation for validating proposed infrastructure changes.
-- **Human-in-the-Loop Workflow:** Keep infrastructure modifications under human control.
-- **Interactive Dashboard:** Provide a Streamlit interface for exploring results.
+- **Resource Analysis:** Identifies potentially underutilized or oversized infrastructure resources.
+- **Cost Estimation:** Estimates cloud spending using pricing datasets and identifies potential cost-saving opportunities.
+- **Carbon Estimation:** Estimates carbon emissions using resource power assumptions and regional carbon-intensity data.
+- **Optimization Recommendations:** Suggests resource configuration changes based on analysis findings.
+- **Human Approval Workflow:** Requires explicit approval before exporting a proposed patch.
+- **Patch Export Safety:** Exports proposed changes as patch files without automatically applying them.
+- **Interactive Dashboard:** Uses Streamlit to present analysis results and optimization insights.
 
-## Project Architecture
+## Agentic Workflow
 
-The project follows a modular architecture in which individual agents handle specific responsibilities.
+The system follows a modular workflow:
 
-- **Analyzer Agent:** Identifies idle and underutilized resources.
-- **Carbon Agent:** Estimates energy usage and carbon emissions.
-- **Fixer Agent:** Suggests potential infrastructure changes without applying them.
-- **Orchestrator Agent:** Coordinates the agents and combines their outputs.
-- **Streamlit Application:** Provides the user interface for interacting with the system.
+1. **Analyzer Agent:** Processes utilization data and identifies optimization opportunities.
+2. **Cost Estimator Agent:** Calculates estimated infrastructure costs.
+3. **Carbon Estimator Agent:** Estimates emissions based on power consumption and regional carbon intensity.
+4. **Fixer Agent:** Prepares proposed optimization changes.
+5. **Approval and Export Layer:** Checks approval against the proposal fingerprint and allows approved patches to be exported for human review.
+
+The workflow is designed for decision support. It does not automatically execute Terraform changes or deploy infrastructure modifications.
+
+## Technology Stack
+
+- Python
+- Streamlit
+- Pandas
+- Plotly
+- Pytest
+- JSON and CSV datasets
+- Git and GitHub
 
 ## Project Structure
 
 ```text
-GreenOps/
-├── app.py
+GreenOps-shared/
 ├── agents/
 │   ├── analyzer.py
-│   ├── carbon_agent.py
+│   ├── cost_estimator.py
+│   ├── carbon_estimator.py
 │   ├── fixer.py
-│   └── orchestrator.py
-├── sample_infra/
-│   └── main.tf
-├── data/
-│   ├── utilisation.csv
-│   ├── pricing.json
-│   └── regions.json
+│   ├── approval.py
+│   ├── approved_export.py
+│   └── approval_workflow.py
 ├── tests/
-│   └── test_agents.py
+├── app.py
 ├── requirements.txt
-└── README.md
+├── README.md
+└── .venv/
 ```
 
-## Technology Stack
+The exact files and dataset directories may vary depending on the current project version.
 
-- **Python:** Core application logic and agent implementation.
-- **Streamlit:** Interactive application interface.
-- **Pandas:** Data processing and analysis, where implemented.
-- **Terraform:** Example infrastructure configuration.
-- **Pytest:** Automated testing.
-- **CSV and JSON:** Storage of synthetic utilization, pricing, and regional carbon-intensity data.
-
-The technology stack may evolve as development progresses.
-
-## Getting Started
+## Installation and Setup
 
 ### Prerequisites
 
-Install Python 3 and pip. Python 3.10 or later is a reasonable starting point, provided it is compatible with the dependencies in `requirements.txt`.
+- Python 3.10 or a compatible version supported by the project dependencies
+- Git
+- Visual Studio Code (recommended)
 
 ### 1. Clone the repository
 
@@ -96,18 +79,12 @@ cd GreenOps
 ### 2. Create a virtual environment
 
 ```bash
-python3 -m venv .venv
+python -m venv .venv
 ```
 
 ### 3. Activate the environment
 
-On macOS or Linux:
-
-```bash
-source .venv/bin/activate
-```
-
-On Windows PowerShell:
+**Windows PowerShell:**
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -116,66 +93,76 @@ On Windows PowerShell:
 ### 4. Install dependencies
 
 ```bash
+python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 5. Run the tests
+If Plotly is missing, install it with:
 
 ```bash
-python -m pytest
+python -m pip install plotly
 ```
 
-### 6. Launch the application
+### 5. Run the dashboard
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
-The application will provide a local URL in the terminal. Open that URL in your browser to access the dashboard.
+Open the local URL displayed in the terminal, usually `http://localhost:8501`.
 
-## Dataset
+## Running Tests
 
-The current project uses synthetic data for development and testing.
+Run the project's automated tests with:
 
-| File | Purpose |
-|---|---|
-| `data/utilisation.csv` | Synthetic infrastructure utilization metrics |
-| `data/pricing.json` | Synthetic hourly pricing and power consumption values |
-| `data/regions.json` | Synthetic regional electricity-grid carbon intensity |
+```bash
+python -m pytest -q
+```
 
-These files are intended to demonstrate the analysis workflow. They should not be treated as real cloud billing, measured energy consumption, or verified emissions data.
+Review the test output to verify which components pass or fail.
 
-## Safety and Security
+## Safety and Governance
 
-GreenOps Agent is designed around a human-approved optimization workflow.
+GreenOps Agent is designed with safety in mind:
 
-- No real cloud account is accessed by the current prototype.
-- Suggested fixes are not automatically applied.
-- Sample infrastructure configurations are illustrative and should not be applied directly.
-- Credentials and secrets should never be committed to version control.
-- The `.env` and `.streamlit/secrets.toml` files should remain excluded through `.gitignore`.
+- Original infrastructure configuration should remain unchanged during analysis.
+- Proposed changes should be kept separate from original configuration files.
+- Patch export requires explicit human approval.
+- Approval is checked against the proposal's SHA-256 fingerprint.
+- Exported patches are not automatically applied.
+- Cost and carbon figures are estimates and depend on dataset quality and assumptions.
 
-Any future integration with cloud providers should include appropriate authentication, permissions, validation, and explicit approval before modifying infrastructure.
+## Measuring Impact
+
+The project can evaluate its potential value using the following metrics:
+
+- Number of resources identified for optimization.
+- Estimated monthly and annual cost savings.
+- Estimated carbon emissions reduction.
+- Time required to analyze resources and generate recommendations.
+- Number of proposals approved, rejected, and exported.
+
+Actual savings and emissions reductions should be verified after any approved change is implemented.
+
+## Current Limitations
+
+- Results depend on the availability and quality of utilization, pricing, and regional carbon-intensity data.
+- Estimates based on sample or synthetic datasets do not represent verified live-cloud measurements.
+- Recommendations require human review before implementation.
+- Live cloud integrations and automatic infrastructure deployment are not assumed to be available.
 
 ## Future Enhancements
 
-- Integration with AWS, Microsoft Azure, and Google Cloud.
-- Analysis of real cloud monitoring and billing data.
-- Improved detection of idle and over-provisioned resources.
-- More accurate energy and carbon-emission estimates.
-- Cost forecasting and optimization prioritization.
-- Automated validation of proposed Terraform changes.
-- Human-approved execution of infrastructure modifications.
-- Expanded test coverage and an interactive optimization dashboard.
+- Integration with cloud provider APIs and billing data.
+- More accurate carbon estimation using provider-specific energy metrics.
+- Improved resource recommendations based on workload patterns.
+- Audit logging and persistent approval records.
+- Before-and-after reporting to measure realized savings.
 
-## Project Goals
+## Project Goal
 
-GreenOps Agent aims to demonstrate how agent-based automation can support sustainable cloud operations by combining infrastructure analysis, cost optimization, environmental impact estimation, and human oversight.
+The goal of GreenOps Agent is to help organizations reduce unnecessary cloud spending and environmental impact through data-driven recommendations, transparent estimates, and human-controlled optimization.
 
 ## License
 
-No open-source license has been specified yet. A suitable license can be added when the project is ready for distribution.
-
----
-
-**GreenOps Agent: Building more efficient, cost-conscious, and sustainable cloud infrastructure.**
+Add the applicable license information here before distributing the project publicly.
